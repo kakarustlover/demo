@@ -122,6 +122,7 @@ impl Gfx {
         let base = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let srgb = base.add_srgb_suffix();
         let config = wgpu::SurfaceConfiguration {
+            color_space: wgpu::ColorSpace::Srgb,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: base,
             width: w,
@@ -155,8 +156,8 @@ impl Gfx {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bgl], // WGPU30: may be `&[Some(&bgl)]`
-            push_constant_ranges: &[],   // WGPU30: renamed to `immediate_size: 0`
+            bind_group_layouts: &[Some(&bgl)], // WGPU30: may be `&[Some(&bgl)]`
+            immediate_size: 0,   // WGPU30: renamed to `immediate_size: 0`
         });
         let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
         let quad_buf = wgpu::VertexBufferLayout {
@@ -192,7 +193,7 @@ impl Gfx {
                 module: &shader,
                 entry_point: Some("vs_quad"),
                 compilation_options: Default::default(),
-                buffers: &[quad_buf],
+                buffers: &[Some(quad_buf)],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -378,7 +379,8 @@ impl Gfx {
 
         self.queue.submit([enc.finish()]);
         self.window.pre_present_notify();
-        frame.present();
+        drop(frame);
+        // surface.present() is automatic or handled by surface in wgpu 30
     }
 }
 
