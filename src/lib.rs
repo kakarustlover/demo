@@ -1,6 +1,4 @@
 //! Android (NativeActivity) demo of the `liquid-rust` crate.
-//! Lines marked `WGPU30` may need small API adjustments for wgpu 30
-//! (reference: examples/demo.rs in https://github.com/al1h3n/liquid-rust).
 
 mod font;
 mod logger;
@@ -103,7 +101,7 @@ impl Gfx {
         let (w, h) = (size.width.max(1), size.height.max(1));
         let scale = window.scale_factor() as f32;
 
-        let instance = wgpu::Instance::default(); // WGPU30: may need an InstanceDescriptor
+        let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).expect("surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -157,8 +155,8 @@ impl Gfx {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bgl], // WGPU30: may be `&[Some(&bgl)]`
-            push_constant_ranges: &[],   // WGPU30: renamed to `immediate_size: 0`
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
         let quad_buf = wgpu::VertexBufferLayout {
@@ -184,7 +182,7 @@ impl Gfx {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: srgb, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             }),
-            multiview_mask: None, // WGPU30: older versions call this `multiview: None`
+            multiview_mask: None,
             cache: None,
         });
         let quad_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -194,7 +192,7 @@ impl Gfx {
                 module: &shader,
                 entry_point: Some("vs_quad"),
                 compilation_options: Default::default(),
-                buffers: &[quad_buf],
+                buffers: &[Some(quad_buf)],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -285,7 +283,7 @@ impl Gfx {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
-            multiview_mask: None, // WGPU30
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.bg_pipe);
         pass.set_bind_group(0, &self.bind_group, &[]);
@@ -400,7 +398,7 @@ impl Gfx {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
-                multiview_mask: None, // WGPU30
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.quad_pipe);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -413,7 +411,7 @@ impl Gfx {
             log::info!("first frame submitted");
         }
         self.window.pre_present_notify();
-        frame.present();
+        self.queue.present(frame);
     }
 }
 
