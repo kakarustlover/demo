@@ -1,0 +1,49 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # liquid-rust needs a very recent Rust (rust-version 1.99, edition 2024).
+      # If `stable` is older than that, change this to `beta`.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # ubuntu-latest ships an Android NDK; cargo-ndk reads ANDROID_NDK_HOME.
+      - name: Build Rust library (arm64)
+        run: cargo ndk -t arm64-v8a -P 26 -o app/src/main/jniLibs build --release
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Package APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiquidRustDemo-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

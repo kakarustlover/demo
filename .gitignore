@@ -1,0 +1,8 @@
+/target
+/.gradle
+/build
+/app/build
+/app/src/main/jniLibs
+local.properties
+*.apk
+.DS_Store
