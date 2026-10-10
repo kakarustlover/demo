@@ -1,15 +1,9 @@
-//! Android (NativeActivity) demo of the `liquid-rust` crate: https://github.com/al1h3n/liquid-rust
-//!
-//! Per frame:
-//!   1. draw an animated background + a dark panel into the `content` texture (our own wgpu pass)
-//!   2. `liquid_rust::Renderer::render` draws the glass on top into the swapchain `target`
-//!   3. draw the text labels over the glass (the library asks the host to draw labels itself)
-//!
-//! NOTE for the agent: lines marked `WGPU30` are the places most likely to need small API
-//! adjustments for wgpu 30. The reference for wgpu 30 + winit boilerplate is
-//! `examples/demo.rs` in https://github.com/al1h3n/liquid-rust.
+//! Android (NativeActivity) demo of the `liquid-rust` crate.
+//! Lines marked `WGPU30` may need small API adjustments for wgpu 30
+//! (reference: examples/demo.rs in https://github.com/al1h3n/liquid-rust).
 
 mod font;
+mod logger;
 mod ui;
 
 use std::sync::Arc;
@@ -100,6 +94,7 @@ struct Gfx {
     start: Instant,
     last: Instant,
     touch: Option<u64>,
+    frames: u64,
 }
 
 impl Gfx {
@@ -120,10 +115,15 @@ impl Gfx {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
 
         let caps = surface.get_capabilities(&adapter);
+        log::info!("adapter: {:?}", adapter.get_info());
+        log::info!(
+            "surface caps: formats={:?} present_modes={:?} alpha={:?}",
+            caps.formats, caps.present_modes, caps.alpha_modes
+        );
         let base = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let srgb = base.add_srgb_suffix();
+        log::info!("window {}x{} scale={} base={:?} srgb={:?}", w, h, scale, base, srgb);
         let config = wgpu::SurfaceConfiguration {
-            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: base,
             width: w,
@@ -132,12 +132,12 @@ impl Gfx {
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: if srgb != base { vec![srgb] } else { vec![] },
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
         let renderer = liquid_rust::Renderer::new(&device, srgb);
 
-        // --- our own pipelines
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -157,8 +157,8 @@ impl Gfx {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[Some(&bgl)], // WGPU30: may be `&[Some(&bgl)]`
-            immediate_size: 0,   // WGPU30: renamed to `immediate_size: 0`
+            bind_group_layouts: &[&bgl], // WGPU30: may be `&[Some(&bgl)]`
+            push_constant_ranges: &[],   // WGPU30: renamed to `immediate_size: 0`
         });
         let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
         let quad_buf = wgpu::VertexBufferLayout {
@@ -194,7 +194,7 @@ impl Gfx {
                 module: &shader,
                 entry_point: Some("vs_quad"),
                 compilation_options: Default::default(),
-                buffers: &[Some(quad_buf)],
+                buffers: &[quad_buf],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -234,10 +234,11 @@ impl Gfx {
         let (content, content_view) = make_content(&device, w, h, srgb);
         let ui = Ui::new(w as f32 / scale, h as f32 / scale);
         let now = Instant::now();
+        log::info!("Gfx created");
 
         Self {
             window, surface, device, queue, config, srgb, renderer, bg_pipe, quad_pipe, bind_group, ubuf, qbuf,
-            _content: content, content_view, ui, scale, start: now, last: now, touch: None,
+            _content: content, content_view, ui, scale, start: now, last: now, touch: None, frames: 0,
         }
     }
 
@@ -258,6 +259,7 @@ impl Gfx {
         let (x, y) = (t.location.x as f32 / self.scale, t.location.y as f32 / self.scale);
         match t.phase {
             TouchPhase::Started if self.touch.is_none() => {
+                log::debug!("touch down {x:.0},{y:.0}");
                 self.touch = Some(t.id);
                 self.ui.pointer_down(x, y);
             }
@@ -270,21 +272,67 @@ impl Gfx {
         }
     }
 
+    /// Background + dark panel into `view`.
+    fn bg_pass(&self, enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, label: &str, panel_count: u32) {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None, // WGPU30
+        });
+        pass.set_pipeline(&self.bg_pipe);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+        pass.set_pipeline(&self.quad_pipe);
+        pass.set_vertex_buffer(0, self.qbuf.slice(..));
+        pass.draw(0..6, 0..panel_count);
+    }
+
     fn render(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.05);
         self.last = now;
         self.ui.update(dt);
 
-        // WGPU30: get_current_texture returns an enum in recent wgpu versions.
+        self.frames += 1;
+        let n = self.frames;
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f) => f,
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                if n <= 5 || n % 120 == 0 {
+                    log::warn!("frame {n}: suboptimal surface");
+                }
+                f
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                if n <= 5 || n % 120 == 0 {
+                    log::warn!("frame {n}: surface timeout/occluded, skipping");
+                }
+                return;
+            }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                log::warn!("frame {n}: surface outdated/lost, reconfiguring");
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::error!("frame {n}: surface validation error");
+                return;
+            }
+            #[allow(unreachable_patterns)]
             _ => return,
         };
+        if n <= 3 || n % 300 == 0 {
+            log::info!("frame {n}: {}x{} bg={} dt={:.4}", self.config.width, self.config.height, self.ui.bg, dt);
+        }
+
         let (w, h) = (self.config.width, self.config.height);
         let s = self.scale;
 
@@ -319,28 +367,10 @@ impl Gfx {
         let target_view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.srgb), ..Default::default() });
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        // 1) content: background + dark panel
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("content"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.content_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None, // WGPU30
-            });
-            pass.set_pipeline(&self.bg_pipe);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-            pass.set_pipeline(&self.quad_pipe);
-            pass.set_vertex_buffer(0, self.qbuf.slice(..));
-            pass.draw(0..6, 0..panel_count);
-        }
+        // 1) background into the content texture, and ALSO directly into the target
+        //    (in case liquid-rust does not copy content into target by itself)
+        self.bg_pass(&mut enc, &self.content_view, "content", panel_count);
+        self.bg_pass(&mut enc, &target_view, "target-bg", panel_count);
 
         // 2) the glass (liquid-rust)
         self.renderer.render(
@@ -352,7 +382,7 @@ impl Gfx {
                 target: &target_view,
                 size: (w, h),
                 scale: s,
-                content_changed: true, // background is animated
+                content_changed: true,
             },
             &self.ui.scene,
         );
@@ -379,9 +409,11 @@ impl Gfx {
         }
 
         self.queue.submit([enc.finish()]);
+        if n == 1 {
+            log::info!("first frame submitted");
+        }
         self.window.pre_present_notify();
-        drop(frame);
-        // surface.present() is automatic or handled by surface in wgpu 30
+        frame.present();
     }
 }
 
@@ -392,6 +424,7 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        log::info!("lifecycle: resumed");
         if self.gfx.is_none() {
             let window = Arc::new(el.create_window(Window::default_attributes()).expect("window"));
             self.gfx = Some(Gfx::new(window));
@@ -399,7 +432,7 @@ impl ApplicationHandler for App {
     }
 
     fn suspended(&mut self, _el: &ActiveEventLoop) {
-        // Android destroys the native window here; drop the surface and recreate on resume.
+        log::info!("lifecycle: suspended");
         self.gfx = None;
     }
 
@@ -407,7 +440,10 @@ impl ApplicationHandler for App {
         let Some(g) = self.gfx.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::Resized(s) => g.resize(s.width, s.height),
+            WindowEvent::Resized(s) => {
+                log::info!("resized {}x{}", s.width, s.height);
+                g.resize(s.width, s.height);
+            }
             WindowEvent::Touch(t) => g.touch_event(t),
             WindowEvent::RedrawRequested => g.render(),
             _ => {}
@@ -425,10 +461,21 @@ impl ApplicationHandler for App {
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
-    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));
-    std::panic::set_hook(Box::new(|info| log::error!("PANIC: {info}")));
+    logger::init(app.internal_data_path());
+    log::info!("android_main start (liquid_demo {})", env!("CARGO_PKG_VERSION"));
 
-    let event_loop = EventLoop::builder().with_android_app(app).build().expect("event loop");
+    let event_loop = match EventLoop::builder().with_android_app(app).build() {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("event loop build failed: {e}");
+            return;
+        }
+    };
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut App::default()).expect("run");
+    if let Err(e) = event_loop.run_app(&mut App::default()) {
+        log::error!("run_app error: {e}");
+    }
+    log::info!("event loop ended, exiting demo process");
+    log::logger().flush();
+    std::process::exit(0);
 }
