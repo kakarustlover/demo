@@ -13,7 +13,7 @@ wgpu = "30"
 winit = { version = "0.30", default-features = false, features = ["android-native-activity", "rwh_06"] }
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
-log = "0.4"
+log = { version = "0.4", features = ["std"] }
 
 [profile.release]
 opt-level = 3
