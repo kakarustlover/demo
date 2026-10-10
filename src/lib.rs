@@ -114,6 +114,7 @@ impl Gfx {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("adapter");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
@@ -122,7 +123,7 @@ impl Gfx {
         let base = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let srgb = base.add_srgb_suffix();
         let config = wgpu::SurfaceConfiguration {
-            color_space: wgpu::ColorSpace::Srgb,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: base,
             width: w,
