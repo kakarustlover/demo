@@ -5,19 +5,29 @@
 
     <application
         android:allowBackup="false"
-        android:hasCode="false"
+        android:hasCode="true"
         android:label="Liquid Rust Demo"
-        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <!-- Launcher: log viewer -->
         <activity
-            android:name="android.app.NativeActivity"
-            android:exported="true"
-            android:screenOrientation="portrait"
-            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode|density">
-            <meta-data android:name="android.app.lib_name" android:value="liquid_demo" />
+            android:name=".LogActivity"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
+
+        <!-- The Rust demo runs in its own process so a crash never kills the log viewer -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="false"
+            android:process=":demo"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode|density">
+            <meta-data android:name="android.app.lib_name" android:value="liquid_demo" />
         </activity>
     </application>
 
