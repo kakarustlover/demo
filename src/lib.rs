@@ -1,15 +1,17 @@
 //! Android (NativeActivity) demo of the `liquid-rust` crate.
 //!
-//! Performance design:
-//!  * scene (background + glass) is rendered at reduced resolution and upscaled
-//!  * background is "baked": redrawn only when it changes (or when anim=1)
-//!  * frames are rendered only while something moves (idle = no GPU work)
-//!  * FPS cap via WaitUntil
-//!  * built-in benchmark (bench=1): times each pass by disabling it, logs "BENCH ..." lines
-//! Settings come from <files dir>/config.txt (written by LogActivity).
+//! Robustness / performance design:
+//!  * 6 quality tiers (tier.rs). Tier 5 (SAFE) never calls the glass shader.
+//!  * runtime governor: if frames are too slow while something moves, drop a tier
+//!  * crash / black-screen detection across launches (running.flag + state.txt)
+//!  * catch_unwind around rendering -> SAFE
+//!  * scene rendered at reduced resolution; background baked; no frames while idle
+//!  * extensive log lines: INIT, STAT (every second), TIER (every change), BENCH
+//! Settings come from <files dir>/config.txt: tier=2 auto=1 anim=0 bench=0
 
 mod font;
 mod logger;
+mod tier;
 mod ui;
 
 use std::path::PathBuf;
@@ -22,72 +24,86 @@ use winit::event::{TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-use ui::{text_w, Ui, BG_LIGHT, TEXT_DOT};
+use tier::{LAST, TIERS};
+use ui::{text_w, ContentRect, Ui, BG_LIGHT, TEXT_DOT};
+
+// ---------------------------------------------------------------- settings / state files
 
 #[derive(Clone, Copy, Debug)]
 struct Settings {
-    fps: f32,
-    scale: f32,
+    tier: usize,
+    auto: bool,
     anim: bool,
-    disp: f32,
     bench: bool,
 }
 
-impl Settings {
-    fn load(dir: Option<PathBuf>) -> Self {
-        let mut s = Settings { fps: 30.0, scale: 0.75, anim: false, disp: 0.0, bench: false };
-        if let Some(d) = dir {
-            if let Ok(txt) = std::fs::read_to_string(d.join("config.txt")) {
-                for line in txt.lines() {
-                    if let Some((k, v)) = line.split_once('=') {
-                        let Ok(v) = v.trim().parse::<f32>() else { continue };
-                        match k.trim() {
-                            "fps" => s.fps = v.clamp(10.0, 120.0),
-                            "scale" => s.scale = v.clamp(0.25, 1.0),
-                            "anim" => s.anim = v >= 0.5,
-                            "disp" => s.disp = v.clamp(0.0, 1.0),
-                            "bench" => s.bench = v >= 0.5,
-                            _ => {}
-                        }
+fn load_settings(dir: &Option<PathBuf>) -> Settings {
+    let mut s = Settings { tier: 2, auto: true, anim: false, bench: false };
+    if let Some(d) = dir {
+        if let Ok(txt) = std::fs::read_to_string(d.join("config.txt")) {
+            for line in txt.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let Ok(v) = v.trim().parse::<f32>() else { continue };
+                    match k.trim() {
+                        "tier" => s.tier = (v.max(0.0) as usize).min(LAST),
+                        "auto" => s.auto = v >= 0.5,
+                        "anim" => s.anim = v >= 0.5,
+                        "bench" => s.bench = v >= 0.5,
+                        _ => {}
                     }
                 }
             }
         }
-        s
+    }
+    s
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct State {
+    /// Launches that did not end cleanly (crash / black screen). Each one lowers the start tier.
+    crashes: usize,
+    /// Tier the governor settled on.
+    auto_tier: usize,
+}
+
+fn load_state(dir: &Option<PathBuf>) -> State {
+    let mut s = State::default();
+    if let Some(d) = dir {
+        if let Ok(txt) = std::fs::read_to_string(d.join("state.txt")) {
+            for line in txt.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let Ok(v) = v.trim().parse::<usize>() else { continue };
+                    match k.trim() {
+                        "crashes" => s.crashes = v,
+                        "auto_tier" => s.auto_tier = v.min(LAST),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+fn save_state(dir: &Option<PathBuf>, s: &State) {
+    if let Some(d) = dir {
+        let _ = std::fs::write(d.join("state.txt"), format!("crashes={}\nauto_tier={}\n", s.crashes, s.auto_tier));
     }
 }
 
-// ---------- benchmark ----------
-
-#[derive(Clone, Copy)]
-struct Mode {
-    name: &'static str,
-    bg: bool,
-    copy: bool,
-    glass: bool,
-    fin: bool,
+fn write_flag(dir: &Option<PathBuf>, content: &str) {
+    if let Some(d) = dir {
+        let _ = std::fs::write(d.join("running.flag"), content);
+    }
 }
 
-const FULL: Mode = Mode { name: "FULL", bg: true, copy: true, glass: true, fin: true };
-const BENCH_MODES: [Mode; 6] = [
-    FULL,
-    Mode { name: "NO GLASS", glass: false, ..FULL },
-    Mode { name: "NO BG SHADER", bg: false, ..FULL },
-    Mode { name: "NO COPY", copy: false, ..FULL },
-    Mode { name: "NO FINAL", fin: false, ..FULL },
-    Mode { name: "EMPTY", bg: false, copy: false, glass: false, fin: false },
-];
-
-struct Bench {
-    mode: usize,
-    t0: Instant,
-    frames: u32,
-    warm: bool,
-    done: bool,
-    last_fps: f32,
+fn remove_flag(dir: &Option<PathBuf>) {
+    if let Some(d) = dir {
+        let _ = std::fs::remove_file(d.join("running.flag"));
+    }
 }
 
-// ---------- gpu types ----------
+// ---------------------------------------------------------------- gpu types
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -128,6 +144,16 @@ fn push_text(out: &mut Vec<Quad>, x: f32, y: f32, dot: f32, s: &str, rgb: [f32; 
             }
         }
         cx += 6.0 * dot;
+    }
+}
+
+fn push_rects(out: &mut Vec<Quad>, rects: &[ContentRect], s: f32) {
+    for r in rects {
+        out.push(Quad {
+            rect: [r.x * s, r.y * s, r.w * s, r.h * s],
+            color: r.color,
+            radius: [r.r * s, 0.0, 0.0, 0.0],
+        });
     }
 }
 
@@ -181,9 +207,31 @@ fn make_targets(
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
         ],
     });
-    log::info!("targets: screen {}x{} -> scene {}x{} (scale {})", w, h, sw, sh, scale);
+    log::info!("targets: screen {}x{} -> scene {}x{} (scale {:.2})", w, h, sw, sh, scale);
     Targets { content, content_view, scene, scene_view, blit_bg, size: (sw, sh) }
 }
+
+// ---------------------------------------------------------------- benchmark / stats
+
+struct Bench {
+    mode: usize,
+    t0: Instant,
+    frames: u32,
+    warm: bool,
+    done: bool,
+    saved_tier: usize,
+}
+
+struct Stat {
+    t0: Instant,
+    frames: u32,
+    active: u32,
+    gap_sum: f32,
+    cpu_ms: f32,
+    glass_ms: f32,
+}
+
+// ---------------------------------------------------------------- Gfx
 
 struct Gfx {
     window: Arc<Window>,
@@ -204,30 +252,39 @@ struct Gfx {
     t: Targets,
     ui: Ui,
     settings: Settings,
+    dir: Option<PathBuf>,
+    state: State,
+    tier: usize,
     scale: f32,
     start: Instant,
     last: Instant,
     touch: Option<u64>,
     frames: u64,
-    fps_t: Instant,
-    fps_n: u32,
+    presented: u64,
+    health_ok: bool,
     fps_val: f32,
-    fps_logs: u32,
     // idle / baked-background state
     dirty: u32,
     content_dirty: bool,
     last_bg: usize,
+    // governor
+    active_run: u32,
+    ema: f32,
+    since_change: u32,
     bench: Bench,
+    st: Stat,
 }
 
 impl Gfx {
-    fn new(window: Arc<Window>, settings: Settings) -> Self {
+    fn new(window: Arc<Window>, settings: Settings, state: State, dir: Option<PathBuf>, start_tier: usize) -> Self {
+        let t_init = Instant::now();
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         let scale = window.scale_factor() as f32;
 
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).expect("surface");
+        log::info!("INIT surface created +{:.0} ms", t_init.elapsed().as_secs_f32() * 1000.0);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -235,17 +292,21 @@ impl Gfx {
             apply_limit_buckets: false,
         }))
         .expect("adapter");
+        log::info!("INIT adapter +{:.0} ms", t_init.elapsed().as_secs_f32() * 1000.0);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+        log::info!("INIT device +{:.0} ms", t_init.elapsed().as_secs_f32() * 1000.0);
 
         let caps = surface.get_capabilities(&adapter);
         log::info!("adapter: {:?}", adapter.get_info());
+        log::info!("adapter features: {:?}", adapter.features());
+        log::info!("adapter limits: {:?}", adapter.limits());
         log::info!(
             "surface caps: formats={:?} present_modes={:?} alpha={:?}",
             caps.formats, caps.present_modes, caps.alpha_modes
         );
         let base = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let srgb = base.add_srgb_suffix();
-        log::info!("window {}x{} scale={} base={:?} srgb={:?} settings={:?}", w, h, scale, base, srgb, settings);
+        log::info!("window {}x{} density={} base={:?} srgb={:?}", w, h, scale, base, srgb);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: base,
@@ -260,6 +321,7 @@ impl Gfx {
         surface.configure(&device, &config);
 
         let renderer = liquid_rust::Renderer::new(&device, srgb);
+        log::info!("INIT liquid-rust renderer +{:.0} ms", t_init.elapsed().as_secs_f32() * 1000.0);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader"),
@@ -388,6 +450,7 @@ impl Gfx {
             multiview_mask: None,
             cache: None,
         });
+        log::info!("INIT pipelines +{:.0} ms", t_init.elapsed().as_secs_f32() * 1000.0);
 
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
@@ -407,17 +470,23 @@ impl Gfx {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }],
         });
 
-        let t = make_targets(&device, &tex_bgl, &sampler, w, h, settings.scale, srgb);
-        let ui = Ui::new(w as f32 / scale, h as f32 / scale, settings.disp);
+        let tier = if settings.bench { 0 } else { start_tier };
+        let t = make_targets(&device, &tex_bgl, &sampler, w, h, TIERS[tier].scale, srgb);
+        let ui = Ui::new(w as f32 / scale, h as f32 / scale, tier);
         let now = Instant::now();
-        log::info!("Gfx created");
+        log::info!(
+            "INIT done in {:.0} ms: start tier {} ({}), auto={}, bench={}",
+            t_init.elapsed().as_secs_f32() * 1000.0, tier, TIERS[tier].name, settings.auto, settings.bench
+        );
 
         Self {
             window, surface, device, queue, config, srgb, renderer, bg_pipe, quad_pipe, blit_pipe, bind_group,
-            tex_bgl, sampler, ubuf, qbuf, t, ui, settings, scale, start: now, last: now, touch: None, frames: 0,
-            fps_t: now, fps_n: 0, fps_val: 0.0, fps_logs: 0,
+            tex_bgl, sampler, ubuf, qbuf, t, ui, settings, dir, state, tier, scale, start: now, last: now,
+            touch: None, frames: 0, presented: 0, health_ok: false, fps_val: 0.0,
             dirty: 8, content_dirty: true, last_bg: 0,
-            bench: Bench { mode: 0, t0: now, frames: 0, warm: false, done: !settings.bench, last_fps: 0.0 },
+            active_run: 0, ema: 0.0, since_change: 0,
+            bench: Bench { mode: 0, t0: now, frames: 0, warm: false, done: !settings.bench, saved_tier: start_tier },
+            st: Stat { t0: now, frames: 0, active: 0, gap_sum: 0.0, cpu_ms: 0.0, glass_ms: 0.0 },
         }
     }
 
@@ -430,6 +499,105 @@ impl Gfx {
         self.bench_active() || self.settings.anim || self.dirty > 0
     }
 
+    fn frame_interval(&self) -> Duration {
+        Duration::from_secs_f32(1.0 / TIERS[self.tier].fps)
+    }
+
+    /// Switch quality tier (rebuilds the render targets if the scale changes).
+    fn set_tier(&mut self, new: usize, reason: &str) {
+        let new = new.min(LAST);
+        if new == self.tier {
+            return;
+        }
+        log::warn!("TIER {} -> {} ({})", TIERS[self.tier].name, TIERS[new].name, reason);
+        let old_scale = TIERS[self.tier].scale;
+        self.tier = new;
+        self.ui.set_tier(new);
+        if (TIERS[new].scale - old_scale).abs() > 1e-3 {
+            self.t = make_targets(
+                &self.device, &self.tex_bgl, &self.sampler,
+                self.config.width, self.config.height, TIERS[new].scale, self.srgb,
+            );
+        }
+        self.content_dirty = true;
+        self.dirty = 8;
+        self.since_change = 0;
+        self.active_run = 0;
+        self.ema = 0.0;
+        log::logger().flush();
+    }
+
+    /// Governor / error fallback: lower the tier and remember it for the next launch.
+    fn degrade(&mut self, new: usize, reason: &str) {
+        self.set_tier(new, reason);
+        self.state.auto_tier = self.state.auto_tier.max(self.tier);
+        save_state(&self.dir, &self.state);
+    }
+
+    fn fallback(&mut self, reason: &str) {
+        log::error!("FALLBACK to SAFE: {}", reason);
+        self.degrade(LAST, reason);
+    }
+
+    fn govern(&mut self, gap: f32) {
+        if self.bench_active() || !self.settings.auto || self.tier >= LAST {
+            return;
+        }
+        if gap > 0.25 {
+            // idle gap: a new touch/animation streak starts
+            self.active_run = 0;
+            self.ema = 0.0;
+            return;
+        }
+        self.active_run += 1;
+        self.since_change += 1;
+        self.ema = if self.ema == 0.0 { gap } else { self.ema * 0.9 + gap * 0.1 };
+        let target = 1.0 / TIERS[self.tier].fps;
+        if self.since_change > 8 && self.active_run >= 20 && self.ema > target * 1.4 {
+            let step = if self.ema > target * 3.0 { 2 } else { 1 };
+            let reason = format!(
+                "auto: avg frame {:.1} ms > {:.1} ms (target {:.1} ms)",
+                self.ema * 1000.0, target * 1400.0, target * 1000.0
+            );
+            let to = self.tier + step;
+            self.degrade(to, &reason);
+        }
+    }
+
+    fn bench_tick(&mut self, now: Instant) {
+        let el = (now - self.bench.t0).as_secs_f32();
+        if !self.bench.warm {
+            if el >= 1.0 {
+                self.bench.warm = true;
+                self.bench.t0 = now;
+                self.bench.frames = 0;
+            }
+            return;
+        }
+        self.bench.frames += 1;
+        if el >= 4.0 {
+            let fps = self.bench.frames as f32 / el;
+            let t = TIERS[self.bench.mode];
+            log::info!(
+                "BENCH {:<9} scale={:.2} {:6.1} fps {:7.1} ms/frame",
+                t.name, t.scale, fps, 1000.0 / fps
+            );
+            self.bench.mode += 1;
+            self.bench.warm = false;
+            self.bench.t0 = now;
+            self.bench.frames = 0;
+            if self.bench.mode >= TIERS.len() {
+                self.bench.done = true;
+                log::info!("BENCH DONE");
+                let saved = self.bench.saved_tier;
+                self.set_tier(saved, "bench finished");
+            } else {
+                let m = self.bench.mode;
+                self.set_tier(m, "bench step");
+            }
+        }
+    }
+
     fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 || (w == self.config.width && h == self.config.height) {
             return;
@@ -437,8 +605,8 @@ impl Gfx {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.t = make_targets(&self.device, &self.tex_bgl, &self.sampler, w, h, self.settings.scale, self.srgb);
-        self.ui = Ui::new(w as f32 / self.scale, h as f32 / self.scale, self.settings.disp);
+        self.t = make_targets(&self.device, &self.tex_bgl, &self.sampler, w, h, TIERS[self.tier].scale, self.srgb);
+        self.ui = Ui::new(w as f32 / self.scale, h as f32 / self.scale, self.tier);
         self.content_dirty = true;
         self.dirty = 8;
     }
@@ -454,6 +622,7 @@ impl Gfx {
             }
             TouchPhase::Moved if self.touch == Some(t.id) => self.ui.pointer_move(x, y),
             TouchPhase::Ended | TouchPhase::Cancelled if self.touch == Some(t.id) => {
+                log::debug!("touch up {x:.0},{y:.0} ({:?})", t.phase);
                 self.touch = None;
                 self.ui.pointer_up(x, y);
             }
@@ -461,8 +630,8 @@ impl Gfx {
         }
     }
 
-    /// Background (optional) + plain content rects into the content texture.
-    fn content_pass(&self, enc: &mut wgpu::CommandEncoder, draw_bg: bool, content_count: u32) {
+    /// Background + plain content rects into the content texture.
+    fn content_pass(&self, enc: &mut wgpu::CommandEncoder, content_count: u32) {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("content"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -477,46 +646,18 @@ impl Gfx {
             multiview_mask: None,
         });
         pass.set_bind_group(0, &self.bind_group, &[]);
-        if draw_bg {
-            pass.set_pipeline(&self.bg_pipe);
-            pass.draw(0..3, 0..1);
-        }
+        pass.set_pipeline(&self.bg_pipe);
+        pass.draw(0..3, 0..1);
         pass.set_pipeline(&self.quad_pipe);
         pass.set_vertex_buffer(0, self.qbuf.slice(..));
         pass.draw(0..6, 0..content_count);
     }
 
-    fn bench_tick(&mut self, now: Instant) {
-        let b = &mut self.bench;
-        let el = (now - b.t0).as_secs_f32();
-        if !b.warm {
-            if el >= 1.0 {
-                b.warm = true;
-                b.t0 = now;
-                b.frames = 0;
-            }
-            return;
-        }
-        b.frames += 1;
-        if el >= 4.0 {
-            let fps = b.frames as f32 / el;
-            b.last_fps = fps;
-            log::info!("BENCH {:<13} {:6.1} fps  {:7.1} ms/frame", BENCH_MODES[b.mode].name, fps, 1000.0 / fps);
-            b.mode += 1;
-            b.warm = false;
-            b.t0 = now;
-            b.frames = 0;
-            if b.mode >= BENCH_MODES.len() {
-                b.done = true;
-                b.mode = 0;
-                log::info!("BENCH DONE");
-            }
-        }
-    }
-
     fn render(&mut self) {
-        let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().min(0.05);
+        let t_start = Instant::now();
+        let now = t_start;
+        let gap = (now - self.last).as_secs_f32();
+        let dt = gap.min(0.05);
         self.last = now;
         if self.ui.update(dt) {
             self.dirty = self.dirty.max(2);
@@ -524,22 +665,16 @@ impl Gfx {
 
         self.frames += 1;
         let n = self.frames;
-
-        self.fps_n += 1;
-        let el = (now - self.fps_t).as_secs_f32();
-        if el >= 0.5 {
-            self.fps_val = self.fps_n as f32 / el;
-            self.fps_n = 0;
-            self.fps_t = now;
-            self.fps_logs += 1;
-            if self.fps_logs % 4 == 1 && !self.bench_active() {
-                log::info!("fps={:.1} (cap {}) scale={} anim={}", self.fps_val, self.settings.fps, self.settings.scale, self.settings.anim);
-            }
-        }
+        let tier = TIERS[self.tier];
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                if n <= 5 || n % 300 == 0 {
+                    log::warn!("frame {n}: suboptimal surface");
+                }
+                f
+            }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 if n <= 5 || n % 120 == 0 {
                     log::warn!("frame {n}: surface timeout/occluded, skipping");
@@ -559,13 +694,15 @@ impl Gfx {
             _ => return,
         };
         if n <= 3 {
-            log::info!("frame {n}: {}x{} bg={} dt={:.4}", self.config.width, self.config.height, self.ui.bg, dt);
+            log::info!(
+                "frame {n}: {}x{} tier={} bg={} dt={:.4}",
+                self.config.width, self.config.height, tier.name, self.ui.bg, dt
+            );
         }
 
-        let mode = if self.bench_active() { BENCH_MODES[self.bench.mode] } else { FULL };
         let bg_changed = self.ui.bg != self.last_bg;
         self.last_bg = self.ui.bg;
-        // The background is baked: redrawn only when needed.
+        // The background is baked: redrawn only when it changed.
         let redraw_content = self.content_dirty || bg_changed || self.settings.anim || self.bench_active();
 
         let (w, h) = (self.config.width, self.config.height);
@@ -580,26 +717,19 @@ impl Gfx {
             bytemuck::bytes_of(&Uniforms { res: [w as f32, h as f32], time: t_anim, kind: self.ui.bg as u32 }),
         );
 
-        // Quads: [content rects][labels]
+        // Quads: [content rects][flat glass (SAFE only)][labels]
         let mut quads: Vec<Quad> = Vec::new();
-        for r in self.ui.content_rects() {
-            quads.push(Quad {
-                rect: [r.x * s, r.y * s, r.w * s, r.h * s],
-                color: r.color,
-                radius: [r.r * s, 0.0, 0.0, 0.0],
-            });
-        }
+        push_rects(&mut quads, &self.ui.content_rects(), s);
         let content_count = quads.len() as u32;
+        if !tier.glass {
+            push_rects(&mut quads, &self.ui.flat_glass(), s);
+        }
         let light = self.ui.bg == BG_LIGHT;
         for t in self.ui.texts() {
             let rgb = if t.panel || !light { [1.0, 1.0, 1.0] } else { [0.08, 0.08, 0.1] };
             push_text(&mut quads, t.x * s, t.y * s, TEXT_DOT * s, &t.s, rgb);
         }
-        let fps_label = if self.bench_active() {
-            format!("{} {:.0} FPS", mode.name, self.fps_val)
-        } else {
-            format!("{:.0} FPS {:.0}%", self.fps_val, self.settings.scale * 100.0)
-        };
+        let fps_label = format!("{} {:.0} FPS", tier.name, self.fps_val);
         let fps_x = (w as f32 / s - text_w(&fps_label) - 12.0) * s;
         let fps_rgb = if light { [0.08, 0.08, 0.1] } else { [1.0, 1.0, 0.4] };
         push_text(&mut quads, fps_x, 8.0 * s, TEXT_DOT * s, &fps_label, fps_rgb);
@@ -610,13 +740,31 @@ impl Gfx {
         let target_view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.srgb), ..Default::default() });
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        // 1) content (background baked + plain rects) - only when it changed
+        // 1) content (baked background + plain rects) - only when it changed
         if redraw_content {
-            self.content_pass(&mut enc, mode.bg, content_count);
+            self.content_pass(&mut enc, content_count);
         }
 
-        // 2) content -> scene (the glass is drawn on top of this copy)
-        if mode.copy {
+        // 2) the glass
+        let mut glass_ms = 0.0;
+        if tier.glass {
+            let tg = Instant::now();
+            self.renderer.render(
+                &self.device,
+                &self.queue,
+                &mut enc,
+                &liquid_rust::Frame {
+                    content: &self.t.content_view,
+                    target: &self.t.scene_view,
+                    size: (sw, sh),
+                    scale: low_scale,
+                    content_changed: redraw_content,
+                },
+                &self.ui.scene,
+            );
+            glass_ms = tg.elapsed().as_secs_f32() * 1000.0;
+        } else {
+            // SAFE: no glass shader. Scene = plain copy of the content.
             enc.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.t.content,
@@ -634,24 +782,7 @@ impl Gfx {
             );
         }
 
-        // 3) the glass (liquid-rust) at low resolution
-        if mode.glass {
-            self.renderer.render(
-                &self.device,
-                &self.queue,
-                &mut enc,
-                &liquid_rust::Frame {
-                    content: &self.t.content_view,
-                    target: &self.t.scene_view,
-                    size: (sw, sh),
-                    scale: low_scale,
-                    content_changed: redraw_content,
-                },
-                &self.ui.scene,
-            );
-        }
-
-        // 4) upscale to the screen + sharp labels at full resolution
+        // 3) upscale the scene to the screen + flat glass (SAFE) + sharp labels
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("final"),
@@ -666,16 +797,14 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if mode.fin {
-                pass.set_pipeline(&self.blit_pipe);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_bind_group(1, &self.t.blit_bg, &[]);
-                pass.draw(0..3, 0..1);
-                if total > content_count {
-                    pass.set_pipeline(&self.quad_pipe);
-                    pass.set_vertex_buffer(0, self.qbuf.slice(..));
-                    pass.draw(0..6, content_count..total);
-                }
+            pass.set_pipeline(&self.blit_pipe);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &self.t.blit_bg, &[]);
+            pass.draw(0..3, 0..1);
+            if total > content_count {
+                pass.set_pipeline(&self.quad_pipe);
+                pass.set_vertex_buffer(0, self.qbuf.slice(..));
+                pass.draw(0..6, content_count..total);
             }
         }
 
@@ -685,36 +814,82 @@ impl Gfx {
         }
         self.window.pre_present_notify();
         self.queue.present(frame);
+        self.presented += 1;
 
+        // ---- bookkeeping: health flag, stats, governor, benchmark
         self.content_dirty = false;
         if self.dirty > 0 {
             self.dirty -= 1;
         }
+        if self.presented == 10 && !self.health_ok {
+            self.health_ok = true;
+            write_flag(&self.dir, "ok");
+            log::info!("HEALTH: 10 frames presented, run marked healthy");
+        }
+
+        self.st.frames += 1;
+        if gap < 0.25 {
+            self.st.active += 1;
+            self.st.gap_sum += gap;
+        }
+        self.st.cpu_ms += t_start.elapsed().as_secs_f32() * 1000.0;
+        self.st.glass_ms += glass_ms;
+        let el = (now - self.st.t0).as_secs_f32();
+        if el >= 1.0 {
+            self.fps_val = self.st.frames as f32 / el;
+            let avg_gap = if self.st.active > 0 { self.st.gap_sum / self.st.active as f32 * 1000.0 } else { 0.0 };
+            log::info!(
+                "STAT tier={} fps={:.1} frame={:.1}ms cpu={:.2}ms glass_cpu={:.2}ms scale={:.2} frames={} bg={}",
+                tier.name, self.fps_val, avg_gap,
+                self.st.cpu_ms / self.st.frames as f32,
+                self.st.glass_ms / self.st.frames as f32,
+                tier.scale, self.st.frames, self.ui.bg
+            );
+            self.st = Stat { t0: now, frames: 0, active: 0, gap_sum: 0.0, cpu_ms: 0.0, glass_ms: 0.0 };
+        }
+
         if self.bench_active() {
             self.bench_tick(now);
+        } else {
+            self.govern(gap);
         }
     }
 }
 
+// ---------------------------------------------------------------- app
+
 struct App {
     gfx: Option<Gfx>,
     settings: Settings,
+    state: State,
+    dir: Option<PathBuf>,
+    start_tier: usize,
     next_frame: Instant,
+    panics: u32,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         log::info!("lifecycle: resumed");
         if self.gfx.is_none() {
+            write_flag(&self.dir, "started");
             let window = Arc::new(el.create_window(Window::default_attributes()).expect("window"));
-            self.gfx = Some(Gfx::new(window, self.settings));
+            self.gfx = Some(Gfx::new(window, self.settings, self.state, self.dir.clone(), self.start_tier));
             self.next_frame = Instant::now();
         }
     }
 
     fn suspended(&mut self, _el: &ActiveEventLoop) {
         log::info!("lifecycle: suspended");
+        if let Some(g) = &self.gfx {
+            if g.health_ok {
+                remove_flag(&self.dir);
+            } else {
+                log::warn!("suspended before 10 healthy frames: crash flag kept -> next launch starts one tier lower");
+            }
+        }
         self.gfx = None;
+        log::logger().flush();
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -725,8 +900,22 @@ impl ApplicationHandler for App {
                 log::info!("resized {}x{}", s.width, s.height);
                 g.resize(s.width, s.height);
             }
+            WindowEvent::Focused(f) => log::info!("focused: {f}"),
+            WindowEvent::Occluded(o) => log::info!("occluded: {o}"),
             WindowEvent::Touch(t) => g.touch_event(t),
-            WindowEvent::RedrawRequested => g.render(),
+            WindowEvent::RedrawRequested => {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.render()));
+                if r.is_err() {
+                    self.panics += 1;
+                    log::error!("render() panicked (#{})", self.panics);
+                    if self.panics > 5 {
+                        log::error!("too many panics, exiting");
+                        log::logger().flush();
+                        std::process::exit(2);
+                    }
+                    g.fallback("render() panicked");
+                }
+            }
             _ => {}
         }
     }
@@ -748,7 +937,7 @@ impl ApplicationHandler for App {
             return;
         }
         let now = Instant::now();
-        let iv = Duration::from_secs_f32(1.0 / self.settings.fps);
+        let iv = g.frame_interval();
         if now >= self.next_frame {
             g.window.request_redraw();
             self.next_frame = if now > self.next_frame + iv { now + iv } else { self.next_frame + iv };
@@ -763,8 +952,23 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
 
     let dir = app.internal_data_path();
     logger::init(dir.clone());
-    let settings = Settings::load(dir);
-    log::info!("android_main start (liquid_demo {}) settings={:?}", env!("CARGO_PKG_VERSION"), settings);
+    let settings = load_settings(&dir);
+    let mut state = load_state(&dir);
+
+    // crash / black-screen detection: the flag is removed only after a healthy, clean run
+    let prev_flag = dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("running.flag")).ok());
+    if let Some(f) = &prev_flag {
+        state.crashes += 1;
+        save_state(&dir, &state);
+        log::error!("PREVIOUS RUN DID NOT END CLEANLY (flag='{}') -> crashes={}", f.trim(), state.crashes);
+    } else {
+        log::info!("previous run ended cleanly (crashes={})", state.crashes);
+    }
+    let start_tier = (settings.tier.max(state.auto_tier) + state.crashes).min(LAST);
+    log::info!(
+        "android_main start (liquid_demo {}) settings={:?} state={:?} -> start tier {} ({})",
+        env!("CARGO_PKG_VERSION"), settings, state, start_tier, TIERS[start_tier].name
+    );
 
     let event_loop = match EventLoop::builder().with_android_app(app).build() {
         Ok(e) => e,
@@ -774,7 +978,7 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         }
     };
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { gfx: None, settings, next_frame: Instant::now() };
+    let mut app = App { gfx: None, settings, state, dir, start_tier, next_frame: Instant::now(), panics: 0 };
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("run_app error: {e}");
     }
