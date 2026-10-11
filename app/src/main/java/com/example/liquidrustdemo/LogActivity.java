@@ -80,7 +80,7 @@ public class LogActivity extends Activity {
             rowQ1.addView(button(MODE_LABELS[i], 0xFF3A4A6B, v -> setTier(idx)));
         }
         root.addView(rowQ1);
-        root.addView(rowQ2);
+        
 
         LinearLayout rowA = row();
         autoButton = button("AUTO", 0xFF4A3A6B, v -> {
