@@ -19,6 +19,7 @@ import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
@@ -32,6 +33,7 @@ public class LogActivity extends Activity {
     private static final int LOGCAT_CHARS = 120_000;
 
     private TextView logView;
+    private TextView qualityView;
     private ScrollView scroll;
     private volatile String lastText = "";
 
@@ -49,19 +51,25 @@ public class LogActivity extends Activity {
         });
 
         TextView title = new TextView(this);
-        title.setText("Liquid Rust Demo - Log viewer");
+        title.setText("Liquid Rust Demo v2 - Log viewer");
         title.setTextColor(0xFFFFFFFF);
         title.setTextSize(17);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setPadding(dp(14), dp(12), dp(14), dp(4));
         root.addView(title);
 
-        TextView hint = new TextView(this);
-        hint.setText("Tap START DEMO. If the screen stays black, press Back, then REFRESH and COPY ALL.");
-        hint.setTextColor(0xFF9A9AA8);
-        hint.setTextSize(12);
-        hint.setPadding(dp(14), 0, dp(14), dp(8));
-        root.addView(hint);
+        qualityView = new TextView(this);
+        qualityView.setTextColor(0xFFFFE066);
+        qualityView.setTextSize(13);
+        qualityView.setPadding(dp(14), 0, dp(14), dp(6));
+        root.addView(qualityView);
+
+        LinearLayout rowQ = row();
+        rowQ.addView(button("HIGH", 0xFF3A4A6B, v -> setQuality("HIGH", 60, 1.0f)));
+        rowQ.addView(button("BALANCED", 0xFF3A4A6B, v -> setQuality("BALANCED", 30, 0.75f)));
+        rowQ.addView(button("LITE", 0xFF3A4A6B, v -> setQuality("LITE", 30, 0.5f)));
+        rowQ.addView(button("MINI", 0xFF3A4A6B, v -> setQuality("MINI", 24, 0.35f)));
+        root.addView(rowQ);
 
         LinearLayout row1 = row();
         row1.addView(button("START DEMO", 0xFF1E7F4F, v ->
@@ -88,12 +96,30 @@ public class LogActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         setContentView(root);
+
+        File cfg = new File(getFilesDir(), "config.txt");
+        if (!cfg.exists()) {
+            setQuality("BALANCED", 30, 0.75f);
+        } else {
+            qualityView.setText("Quality: " + readTail(cfg, 200).trim().replace('\n', ' '));
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         refresh();
+    }
+
+    private void setQuality(String name, int fps, float scale) {
+        try (FileOutputStream out = new FileOutputStream(new File(getFilesDir(), "config.txt"))) {
+            out.write(("fps=" + fps + "\nscale=" + scale + "\n").getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            Toast.makeText(this, "Cannot save: " + e, Toast.LENGTH_LONG).show();
+            return;
+        }
+        qualityView.setText("Quality: " + name + "  (" + fps + " FPS cap, render scale " + scale + ")");
+        Toast.makeText(this, name + " selected", Toast.LENGTH_SHORT).show();
     }
 
     private int dp(int v) {
@@ -111,7 +137,7 @@ public class LogActivity extends Activity {
         Button b = new Button(this);
         b.setText(text);
         b.setTextColor(0xFFFFFFFF);
-        b.setTextSize(12);
+        b.setTextSize(11);
         b.setBackgroundColor(color);
         b.setOnClickListener(l);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(46), 1f);
