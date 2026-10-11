@@ -30,19 +30,19 @@ import java.util.Locale;
 public class LogActivity extends Activity {
     private static final int APP_LOG_CHARS = 150_000;
     private static final int PREV_LOG_CHARS = 50_000;
-    private static final int LOGCAT_CHARS = 120_000;
+    private static final int LOGCAT_CHARS = 100_000;
+    private static final String[] TIER_NAMES = {"ULTRA", "HIGH", "BALANCED", "LITE", "MINI", "SAFE"};
 
     private TextView logView;
     private TextView qualityView;
+    private Button autoButton;
     private Button animButton;
     private ScrollView scroll;
     private volatile String lastText = "";
 
-    // current settings (written to config.txt before every demo start)
-    private String qName = "BALANCED";
-    private int fps = 30;
-    private float scale = 0.75f;
-    private float disp = 0f;
+    // written to config.txt before every demo start
+    private int tier = 2;
+    private boolean auto = true;
     private boolean anim = false;
 
     @Override
@@ -68,24 +68,32 @@ public class LogActivity extends Activity {
 
         qualityView = new TextView(this);
         qualityView.setTextColor(0xFFFFE066);
-        qualityView.setTextSize(13);
+        qualityView.setTextSize(12);
         qualityView.setPadding(dp(14), 0, dp(14), dp(6));
         root.addView(qualityView);
 
-        LinearLayout rowQ = row();
-        rowQ.addView(button("HIGH", 0xFF3A4A6B, v -> setQuality("HIGH", 60, 1.0f, 0.2f)));
-        rowQ.addView(button("BALANCED", 0xFF3A4A6B, v -> setQuality("BALANCED", 30, 0.75f, 0f)));
-        rowQ.addView(button("LITE", 0xFF3A4A6B, v -> setQuality("LITE", 30, 0.5f, 0f)));
-        rowQ.addView(button("MINI", 0xFF3A4A6B, v -> setQuality("MINI", 24, 0.35f, 0f)));
-        root.addView(rowQ);
+        LinearLayout rowQ1 = row();
+        LinearLayout rowQ2 = row();
+        for (int i = 0; i < TIER_NAMES.length; i++) {
+            final int idx = i;
+            Button b = button(TIER_NAMES[i], 0xFF3A4A6B, v -> setTier(idx));
+            (i < 3 ? rowQ1 : rowQ2).addView(b);
+        }
+        root.addView(rowQ1);
+        root.addView(rowQ2);
 
         LinearLayout rowA = row();
-        animButton = button("BG ANIM: OFF", 0xFF4A3A6B, v -> {
+        autoButton = button("AUTO", 0xFF4A3A6B, v -> {
+            auto = !auto;
+            updateLabel();
+        });
+        animButton = button("BG ANIM", 0xFF4A3A6B, v -> {
             anim = !anim;
             updateLabel();
         });
+        rowA.addView(autoButton);
         rowA.addView(animButton);
-        rowA.addView(button("BENCHMARK (30 s)", 0xFF8A5A1E, v -> startDemo(true)));
+        rowA.addView(button("BENCH", 0xFF8A5A1E, v -> startDemo(true)));
         root.addView(rowA);
 
         LinearLayout row1 = row();
@@ -118,27 +126,31 @@ public class LogActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        updateLabel();
         refresh();
     }
 
-    private void setQuality(String name, int f, float s, float d) {
-        qName = name;
-        fps = f;
-        scale = s;
-        disp = d;
+    /** User picked a quality: also resets the automatic fallback memory. */
+    private void setTier(int t) {
+        tier = t;
+        new File(getFilesDir(), "state.txt").delete();
+        new File(getFilesDir(), "running.flag").delete();
         updateLabel();
-        Toast.makeText(this, name + " selected", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, TIER_NAMES[t] + " selected (fallback memory reset)", Toast.LENGTH_SHORT).show();
     }
 
     private void updateLabel() {
-        qualityView.setText("Quality: " + qName + "  (cap " + fps + " FPS, scale " + scale
-                + ", dispersion " + disp + ", bg anim " + (anim ? "ON" : "OFF") + ")");
-        animButton.setText("BG ANIM: " + (anim ? "ON" : "OFF"));
+        String state = readTail(new File(getFilesDir(), "state.txt"), 200).trim().replace('\n', ' ');
+        if (state.startsWith("(")) state = "none";
+        qualityView.setText("Tier: " + TIER_NAMES[tier] + " | auto " + (auto ? "ON" : "OFF")
+                + " | bg anim " + (anim ? "ON" : "OFF") + "\nfallback memory: " + state);
+        autoButton.setText("AUTO: " + (auto ? "ON" : "OFF"));
+        animButton.setText("ANIM: " + (anim ? "ON" : "OFF"));
     }
 
     private void writeCfg(boolean bench) {
-        String s = "fps=" + fps + "\nscale=" + scale + "\nanim=" + (anim ? 1 : 0)
-                + "\ndisp=" + disp + "\nbench=" + (bench ? 1 : 0) + "\n";
+        String s = "tier=" + tier + "\nauto=" + (auto ? 1 : 0) + "\nanim=" + (anim ? 1 : 0)
+                + "\nbench=" + (bench ? 1 : 0) + "\n";
         try (FileOutputStream out = new FileOutputStream(new File(getFilesDir(), "config.txt"))) {
             out.write(s.getBytes(StandardCharsets.UTF_8));
         } catch (Exception e) {
@@ -149,7 +161,7 @@ public class LogActivity extends Activity {
     private void startDemo(boolean bench) {
         writeCfg(bench);
         if (bench) {
-            Toast.makeText(this, "Benchmark runs ~30 s, then press Back and COPY ALL", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Benchmark: 6 tiers x 5 s. Then Back and COPY ALL", Toast.LENGTH_LONG).show();
         }
         startActivity(new Intent(this, NativeActivity.class));
     }
@@ -172,8 +184,8 @@ public class LogActivity extends Activity {
         b.setTextSize(11);
         b.setBackgroundColor(color);
         b.setOnClickListener(l);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(46), 1f);
-        lp.setMargins(dp(4), dp(4), dp(4), dp(4));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        lp.setMargins(dp(4), dp(3), dp(4), dp(3));
         b.setLayoutParams(lp);
         return b;
     }
@@ -185,40 +197,54 @@ public class LogActivity extends Activity {
             lastText = text;
             runOnUiThread(() -> {
                 logView.setText(text);
-                scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+                scroll.post(() -> scroll.fullScroll(View.FOCUS_UP));
             });
         }).start();
     }
 
+    /** Key lines only: errors, tier changes, crash detection, benchmark, last STAT. */
+    private static String summarize(String log) {
+        StringBuilder sb = new StringBuilder();
+        String lastStat = null;
+        for (String line : log.split("\n")) {
+            if (line.contains(": STAT ")) {
+                lastStat = line;
+            } else if (line.contains("TIER ") || line.contains("ERROR") || line.contains("PANIC")
+                    || line.contains("PREVIOUS RUN") || line.contains("BENCH") || line.contains("FALLBACK")
+                    || line.contains("HEALTH") || line.contains("suspended before")) {
+                sb.append(line).append('\n');
+            }
+        }
+        if (lastStat != null) sb.append(lastStat).append('\n');
+        return sb.toString();
+    }
+
     private String buildReport() {
         StringBuilder sb = new StringBuilder();
+        File dir = getFilesDir();
+        String cur = readTail(new File(dir, "liquid_demo.log"), APP_LOG_CHARS);
+        String prev = readTail(new File(dir, "liquid_demo.prev.log"), PREV_LOG_CHARS);
+
         sb.append("=== DEVICE ===\n");
         sb.append("Time: ").append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())).append('\n');
         sb.append("Model: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
         sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n");
         sb.append("ABI: ").append(Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "?").append('\n');
         sb.append("Density: ").append(getResources().getDisplayMetrics().density).append('\n');
+        sb.append("config.txt: ").append(readTail(new File(dir, "config.txt"), 200).trim().replace('\n', ' ')).append('\n');
+        sb.append("state.txt: ").append(readTail(new File(dir, "state.txt"), 200).trim().replace('\n', ' ')).append('\n');
+        sb.append("running.flag: ").append(new File(dir, "running.flag").exists() ? "PRESENT (last run did not end cleanly)" : "absent").append('\n');
 
-        File dir = getFilesDir();
-        String log = readTail(new File(dir, "liquid_demo.log"), APP_LOG_CHARS);
-        // benchmark summary first (easy to copy)
-        StringBuilder bench = new StringBuilder();
-        for (String line : log.split("\n")) {
-            if (line.contains("BENCH")) bench.append(line).append('\n');
-        }
-        if (bench.length() > 0) {
-            sb.append("\n=== BENCHMARK ===\n").append(bench);
-        }
-        sb.append("\n=== APP LOG (this run) ===\n").append(log);
-        sb.append("\n=== APP LOG (previous run) ===\n");
-        sb.append(readTail(new File(dir, "liquid_demo.prev.log"), PREV_LOG_CHARS));
-        sb.append("\n=== LOGCAT (this app, newest last) ===\n");
-        sb.append(readLogcat(LOGCAT_CHARS));
+        sb.append("\n=== SUMMARY (this run) ===\n").append(summarize(cur));
+        sb.append("\n=== SUMMARY (previous run) ===\n").append(summarize(prev));
+        sb.append("\n=== APP LOG (this run) ===\n").append(cur);
+        sb.append("\n=== APP LOG (previous run) ===\n").append(prev);
+        sb.append("\n=== LOGCAT (this app, newest last) ===\n").append(readLogcat(LOGCAT_CHARS));
         return sb.toString();
     }
 
     private static String readTail(File f, int maxChars) {
-        if (!f.exists()) return "(no file yet: the demo has not been started)\n";
+        if (!f.exists()) return "(no file yet)\n";
         try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
             long len = raf.length();
             long start = Math.max(0, len - (long) maxChars * 2);
@@ -263,7 +289,7 @@ public class LogActivity extends Activity {
 
     private void share() {
         String t = lastText;
-        if (t.length() > 150_000) t = t.substring(t.length() - 150_000);
+        if (t.length() > 150_000) t = t.substring(0, 150_000);
         Intent i = new Intent(Intent.ACTION_SEND);
         i.setType("text/plain");
         i.putExtra(Intent.EXTRA_SUBJECT, "Liquid Rust Demo log");
