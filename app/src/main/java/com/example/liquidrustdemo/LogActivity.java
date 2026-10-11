@@ -34,8 +34,16 @@ public class LogActivity extends Activity {
 
     private TextView logView;
     private TextView qualityView;
+    private Button animButton;
     private ScrollView scroll;
     private volatile String lastText = "";
+
+    // current settings (written to config.txt before every demo start)
+    private String qName = "BALANCED";
+    private int fps = 30;
+    private float scale = 0.75f;
+    private float disp = 0f;
+    private boolean anim = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -65,15 +73,23 @@ public class LogActivity extends Activity {
         root.addView(qualityView);
 
         LinearLayout rowQ = row();
-        rowQ.addView(button("HIGH", 0xFF3A4A6B, v -> setQuality("HIGH", 60, 1.0f)));
-        rowQ.addView(button("BALANCED", 0xFF3A4A6B, v -> setQuality("BALANCED", 30, 0.75f)));
-        rowQ.addView(button("LITE", 0xFF3A4A6B, v -> setQuality("LITE", 30, 0.5f)));
-        rowQ.addView(button("MINI", 0xFF3A4A6B, v -> setQuality("MINI", 24, 0.35f)));
+        rowQ.addView(button("HIGH", 0xFF3A4A6B, v -> setQuality("HIGH", 60, 1.0f, 0.2f)));
+        rowQ.addView(button("BALANCED", 0xFF3A4A6B, v -> setQuality("BALANCED", 30, 0.75f, 0f)));
+        rowQ.addView(button("LITE", 0xFF3A4A6B, v -> setQuality("LITE", 30, 0.5f, 0f)));
+        rowQ.addView(button("MINI", 0xFF3A4A6B, v -> setQuality("MINI", 24, 0.35f, 0f)));
         root.addView(rowQ);
 
+        LinearLayout rowA = row();
+        animButton = button("BG ANIM: OFF", 0xFF4A3A6B, v -> {
+            anim = !anim;
+            updateLabel();
+        });
+        rowA.addView(animButton);
+        rowA.addView(button("BENCHMARK (30 s)", 0xFF8A5A1E, v -> startDemo(true)));
+        root.addView(rowA);
+
         LinearLayout row1 = row();
-        row1.addView(button("START DEMO", 0xFF1E7F4F, v ->
-                startActivity(new Intent(this, NativeActivity.class))));
+        row1.addView(button("START DEMO", 0xFF1E7F4F, v -> startDemo(false)));
         row1.addView(button("REFRESH", 0xFF2D3A55, v -> refresh()));
         root.addView(row1);
 
@@ -96,13 +112,7 @@ public class LogActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         setContentView(root);
-
-        File cfg = new File(getFilesDir(), "config.txt");
-        if (!cfg.exists()) {
-            setQuality("BALANCED", 30, 0.75f);
-        } else {
-            qualityView.setText("Quality: " + readTail(cfg, 200).trim().replace('\n', ' '));
-        }
+        updateLabel();
     }
 
     @Override
@@ -111,15 +121,37 @@ public class LogActivity extends Activity {
         refresh();
     }
 
-    private void setQuality(String name, int fps, float scale) {
+    private void setQuality(String name, int f, float s, float d) {
+        qName = name;
+        fps = f;
+        scale = s;
+        disp = d;
+        updateLabel();
+        Toast.makeText(this, name + " selected", Toast.LENGTH_SHORT).show();
+    }
+
+    private void updateLabel() {
+        qualityView.setText("Quality: " + qName + "  (cap " + fps + " FPS, scale " + scale
+                + ", dispersion " + disp + ", bg anim " + (anim ? "ON" : "OFF") + ")");
+        animButton.setText("BG ANIM: " + (anim ? "ON" : "OFF"));
+    }
+
+    private void writeCfg(boolean bench) {
+        String s = "fps=" + fps + "\nscale=" + scale + "\nanim=" + (anim ? 1 : 0)
+                + "\ndisp=" + disp + "\nbench=" + (bench ? 1 : 0) + "\n";
         try (FileOutputStream out = new FileOutputStream(new File(getFilesDir(), "config.txt"))) {
-            out.write(("fps=" + fps + "\nscale=" + scale + "\n").getBytes(StandardCharsets.UTF_8));
+            out.write(s.getBytes(StandardCharsets.UTF_8));
         } catch (Exception e) {
             Toast.makeText(this, "Cannot save: " + e, Toast.LENGTH_LONG).show();
-            return;
         }
-        qualityView.setText("Quality: " + name + "  (" + fps + " FPS cap, render scale " + scale + ")");
-        Toast.makeText(this, name + " selected", Toast.LENGTH_SHORT).show();
+    }
+
+    private void startDemo(boolean bench) {
+        writeCfg(bench);
+        if (bench) {
+            Toast.makeText(this, "Benchmark runs ~30 s, then press Back and COPY ALL", Toast.LENGTH_LONG).show();
+        }
+        startActivity(new Intent(this, NativeActivity.class));
     }
 
     private int dp(int v) {
@@ -168,8 +200,16 @@ public class LogActivity extends Activity {
         sb.append("Density: ").append(getResources().getDisplayMetrics().density).append('\n');
 
         File dir = getFilesDir();
-        sb.append("\n=== APP LOG (this run) ===\n");
-        sb.append(readTail(new File(dir, "liquid_demo.log"), APP_LOG_CHARS));
+        String log = readTail(new File(dir, "liquid_demo.log"), APP_LOG_CHARS);
+        // benchmark summary first (easy to copy)
+        StringBuilder bench = new StringBuilder();
+        for (String line : log.split("\n")) {
+            if (line.contains("BENCH")) bench.append(line).append('\n');
+        }
+        if (bench.length() > 0) {
+            sb.append("\n=== BENCHMARK ===\n").append(bench);
+        }
+        sb.append("\n=== APP LOG (this run) ===\n").append(log);
         sb.append("\n=== APP LOG (previous run) ===\n");
         sb.append(readTail(new File(dir, "liquid_demo.prev.log"), PREV_LOG_CHARS));
         sb.append("\n=== LOGCAT (this app, newest last) ===\n");
