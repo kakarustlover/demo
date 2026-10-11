@@ -6,7 +6,7 @@
     <application
         android:allowBackup="false"
         android:hasCode="true"
-        android:label="Liquid Rust Demo"
+        android:label="Liquid Rust Demo v2"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
         <!-- Launcher: log viewer -->
