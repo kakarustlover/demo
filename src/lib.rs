@@ -1,6 +1,12 @@
 //! Android (NativeActivity) demo of the `liquid-rust` crate.
-//! Scene is rendered at reduced resolution, upscaled, FPS-capped. Settings come from
-//! <files dir>/config.txt (written by LogActivity): fps=30 / scale=0.75
+//!
+//! Performance design:
+//!  * scene (background + glass) is rendered at reduced resolution and upscaled
+//!  * background is "baked": redrawn only when it changes (or when anim=1)
+//!  * frames are rendered only while something moves (idle = no GPU work)
+//!  * FPS cap via WaitUntil
+//!  * built-in benchmark (bench=1): times each pass by disabling it, logs "BENCH ..." lines
+//! Settings come from <files dir>/config.txt (written by LogActivity).
 
 mod font;
 mod logger;
@@ -22,11 +28,14 @@ use ui::{text_w, Ui, BG_LIGHT, TEXT_DOT};
 struct Settings {
     fps: f32,
     scale: f32,
+    anim: bool,
+    disp: f32,
+    bench: bool,
 }
 
 impl Settings {
     fn load(dir: Option<PathBuf>) -> Self {
-        let mut s = Settings { fps: 30.0, scale: 0.75 };
+        let mut s = Settings { fps: 30.0, scale: 0.75, anim: false, disp: 0.0, bench: false };
         if let Some(d) = dir {
             if let Ok(txt) = std::fs::read_to_string(d.join("config.txt")) {
                 for line in txt.lines() {
@@ -35,6 +44,9 @@ impl Settings {
                         match k.trim() {
                             "fps" => s.fps = v.clamp(10.0, 120.0),
                             "scale" => s.scale = v.clamp(0.25, 1.0),
+                            "anim" => s.anim = v >= 0.5,
+                            "disp" => s.disp = v.clamp(0.0, 1.0),
+                            "bench" => s.bench = v >= 0.5,
                             _ => {}
                         }
                     }
@@ -44,6 +56,38 @@ impl Settings {
         s
     }
 }
+
+// ---------- benchmark ----------
+
+#[derive(Clone, Copy)]
+struct Mode {
+    name: &'static str,
+    bg: bool,
+    copy: bool,
+    glass: bool,
+    fin: bool,
+}
+
+const FULL: Mode = Mode { name: "FULL", bg: true, copy: true, glass: true, fin: true };
+const BENCH_MODES: [Mode; 6] = [
+    FULL,
+    Mode { name: "NO GLASS", glass: false, ..FULL },
+    Mode { name: "NO BG SHADER", bg: false, ..FULL },
+    Mode { name: "NO COPY", copy: false, ..FULL },
+    Mode { name: "NO FINAL", fin: false, ..FULL },
+    Mode { name: "EMPTY", bg: false, copy: false, glass: false, fin: false },
+];
+
+struct Bench {
+    mode: usize,
+    t0: Instant,
+    frames: u32,
+    warm: bool,
+    done: bool,
+    last_fps: f32,
+}
+
+// ---------- gpu types ----------
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -87,7 +131,6 @@ fn push_text(out: &mut Vec<Quad>, x: f32, y: f32, dot: f32, s: &str, rgb: [f32; 
     }
 }
 
-/// Low-resolution render targets + the bind group used to upscale `scene` to the screen.
 struct Targets {
     content: wgpu::Texture,
     content_view: wgpu::TextureView,
@@ -170,6 +213,11 @@ struct Gfx {
     fps_n: u32,
     fps_val: f32,
     fps_logs: u32,
+    // idle / baked-background state
+    dirty: u32,
+    content_dirty: bool,
+    last_bg: usize,
+    bench: Bench,
 }
 
 impl Gfx {
@@ -360,7 +408,7 @@ impl Gfx {
         });
 
         let t = make_targets(&device, &tex_bgl, &sampler, w, h, settings.scale, srgb);
-        let ui = Ui::new(w as f32 / scale, h as f32 / scale);
+        let ui = Ui::new(w as f32 / scale, h as f32 / scale, settings.disp);
         let now = Instant::now();
         log::info!("Gfx created");
 
@@ -368,7 +416,18 @@ impl Gfx {
             window, surface, device, queue, config, srgb, renderer, bg_pipe, quad_pipe, blit_pipe, bind_group,
             tex_bgl, sampler, ubuf, qbuf, t, ui, settings, scale, start: now, last: now, touch: None, frames: 0,
             fps_t: now, fps_n: 0, fps_val: 0.0, fps_logs: 0,
+            dirty: 8, content_dirty: true, last_bg: 0,
+            bench: Bench { mode: 0, t0: now, frames: 0, warm: false, done: !settings.bench, last_fps: 0.0 },
         }
+    }
+
+    fn bench_active(&self) -> bool {
+        self.settings.bench && !self.bench.done
+    }
+
+    /// Should we draw another frame right now?
+    fn needs_frame(&self) -> bool {
+        self.bench_active() || self.settings.anim || self.dirty > 0
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -379,10 +438,13 @@ impl Gfx {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.t = make_targets(&self.device, &self.tex_bgl, &self.sampler, w, h, self.settings.scale, self.srgb);
-        self.ui = Ui::new(w as f32 / self.scale, h as f32 / self.scale);
+        self.ui = Ui::new(w as f32 / self.scale, h as f32 / self.scale, self.settings.disp);
+        self.content_dirty = true;
+        self.dirty = 8;
     }
 
     fn touch_event(&mut self, t: winit::event::Touch) {
+        self.dirty = 8;
         let (x, y) = (t.location.x as f32 / self.scale, t.location.y as f32 / self.scale);
         match t.phase {
             TouchPhase::Started if self.touch.is_none() => {
@@ -399,12 +461,12 @@ impl Gfx {
         }
     }
 
-    /// Background + dark panel into `view`.
-    fn bg_pass(&self, enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, label: &str, panel_count: u32) {
+    /// Background (optional) + plain content rects into the content texture.
+    fn content_pass(&self, enc: &mut wgpu::CommandEncoder, draw_bg: bool, content_count: u32) {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some(label),
+            label: Some("content"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
+                view: &self.t.content_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
@@ -414,24 +476,55 @@ impl Gfx {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.bg_pipe);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        if draw_bg {
+            pass.set_pipeline(&self.bg_pipe);
+            pass.draw(0..3, 0..1);
+        }
         pass.set_pipeline(&self.quad_pipe);
         pass.set_vertex_buffer(0, self.qbuf.slice(..));
-        pass.draw(0..6, 0..panel_count);
+        pass.draw(0..6, 0..content_count);
+    }
+
+    fn bench_tick(&mut self, now: Instant) {
+        let b = &mut self.bench;
+        let el = (now - b.t0).as_secs_f32();
+        if !b.warm {
+            if el >= 1.0 {
+                b.warm = true;
+                b.t0 = now;
+                b.frames = 0;
+            }
+            return;
+        }
+        b.frames += 1;
+        if el >= 4.0 {
+            let fps = b.frames as f32 / el;
+            b.last_fps = fps;
+            log::info!("BENCH {:<13} {:6.1} fps  {:7.1} ms/frame", BENCH_MODES[b.mode].name, fps, 1000.0 / fps);
+            b.mode += 1;
+            b.warm = false;
+            b.t0 = now;
+            b.frames = 0;
+            if b.mode >= BENCH_MODES.len() {
+                b.done = true;
+                b.mode = 0;
+                log::info!("BENCH DONE");
+            }
+        }
     }
 
     fn render(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.05);
         self.last = now;
-        self.ui.update(dt);
+        if self.ui.update(dt) {
+            self.dirty = self.dirty.max(2);
+        }
 
         self.frames += 1;
         let n = self.frames;
 
-        // measured FPS (updated twice a second, logged every ~2 s)
         self.fps_n += 1;
         let el = (now - self.fps_t).as_secs_f32();
         if el >= 0.5 {
@@ -439,19 +532,14 @@ impl Gfx {
             self.fps_n = 0;
             self.fps_t = now;
             self.fps_logs += 1;
-            if self.fps_logs % 4 == 1 {
-                log::info!("fps={:.1} (target {}) scale={}", self.fps_val, self.settings.fps, self.settings.scale);
+            if self.fps_logs % 4 == 1 && !self.bench_active() {
+                log::info!("fps={:.1} (cap {}) scale={} anim={}", self.fps_val, self.settings.fps, self.settings.scale, self.settings.anim);
             }
         }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                if n <= 5 || n % 120 == 0 {
-                    log::warn!("frame {n}: suboptimal surface");
-                }
-                f
-            }
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 if n <= 5 || n % 120 == 0 {
                     log::warn!("frame {n}: surface timeout/occluded, skipping");
@@ -474,36 +562,44 @@ impl Gfx {
             log::info!("frame {n}: {}x{} bg={} dt={:.4}", self.config.width, self.config.height, self.ui.bg, dt);
         }
 
+        let mode = if self.bench_active() { BENCH_MODES[self.bench.mode] } else { FULL };
+        let bg_changed = self.ui.bg != self.last_bg;
+        self.last_bg = self.ui.bg;
+        // The background is baked: redrawn only when needed.
+        let redraw_content = self.content_dirty || bg_changed || self.settings.anim || self.bench_active();
+
         let (w, h) = (self.config.width, self.config.height);
         let (sw, sh) = self.t.size;
         let s = self.scale;
         let low_scale = s * (sw as f32 / w as f32);
+        let t_anim = if self.settings.anim { (now - self.start).as_secs_f32() } else { 0.0 };
 
         self.queue.write_buffer(
             &self.ubuf,
             0,
-            bytemuck::bytes_of(&Uniforms {
-                res: [w as f32, h as f32],
-                time: (now - self.start).as_secs_f32(),
-                kind: self.ui.bg as u32,
-            }),
+            bytemuck::bytes_of(&Uniforms { res: [w as f32, h as f32], time: t_anim, kind: self.ui.bg as u32 }),
         );
 
-        // Quads: [panel] then [text + fps]
+        // Quads: [content rects][labels]
         let mut quads: Vec<Quad> = Vec::new();
-        let (px, py, pw, ph, pr) = self.ui.panel();
-        quads.push(Quad {
-            rect: [px * s, py * s, pw * s, ph * s],
-            color: [0.0, 0.0, 0.0, 0.45],
-            radius: [pr * s, 0.0, 0.0, 0.0],
-        });
-        let panel_count = quads.len() as u32;
+        for r in self.ui.content_rects() {
+            quads.push(Quad {
+                rect: [r.x * s, r.y * s, r.w * s, r.h * s],
+                color: r.color,
+                radius: [r.r * s, 0.0, 0.0, 0.0],
+            });
+        }
+        let content_count = quads.len() as u32;
         let light = self.ui.bg == BG_LIGHT;
         for t in self.ui.texts() {
             let rgb = if t.panel || !light { [1.0, 1.0, 1.0] } else { [0.08, 0.08, 0.1] };
             push_text(&mut quads, t.x * s, t.y * s, TEXT_DOT * s, &t.s, rgb);
         }
-        let fps_label = format!("{:.0} FPS {:.0}%", self.fps_val, self.settings.scale * 100.0);
+        let fps_label = if self.bench_active() {
+            format!("{} {:.0} FPS", mode.name, self.fps_val)
+        } else {
+            format!("{:.0} FPS {:.0}%", self.fps_val, self.settings.scale * 100.0)
+        };
         let fps_x = (w as f32 / s - text_w(&fps_label) - 12.0) * s;
         let fps_rgb = if light { [0.08, 0.08, 0.1] } else { [1.0, 1.0, 0.4] };
         push_text(&mut quads, fps_x, 8.0 * s, TEXT_DOT * s, &fps_label, fps_rgb);
@@ -514,40 +610,46 @@ impl Gfx {
         let target_view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.srgb), ..Default::default() });
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        // 1) background + panel into the low-res content texture
-        self.bg_pass(&mut enc, &self.t.content_view, "content", panel_count);
+        // 1) content (background baked + plain rects) - only when it changed
+        if redraw_content {
+            self.content_pass(&mut enc, mode.bg, content_count);
+        }
 
-        // 2) copy content -> scene (cheap GPU copy; glass is drawn on top of the copy)
-        enc.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.t.content,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.t.scene,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
-        );
+        // 2) content -> scene (the glass is drawn on top of this copy)
+        if mode.copy {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.t.content,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.t.scene,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
+            );
+        }
 
         // 3) the glass (liquid-rust) at low resolution
-        self.renderer.render(
-            &self.device,
-            &self.queue,
-            &mut enc,
-            &liquid_rust::Frame {
-                content: &self.t.content_view,
-                target: &self.t.scene_view,
-                size: (sw, sh),
-                scale: low_scale,
-                content_changed: true,
-            },
-            &self.ui.scene,
-        );
+        if mode.glass {
+            self.renderer.render(
+                &self.device,
+                &self.queue,
+                &mut enc,
+                &liquid_rust::Frame {
+                    content: &self.t.content_view,
+                    target: &self.t.scene_view,
+                    size: (sw, sh),
+                    scale: low_scale,
+                    content_changed: redraw_content,
+                },
+                &self.ui.scene,
+            );
+        }
 
         // 4) upscale to the screen + sharp labels at full resolution
         {
@@ -564,13 +666,17 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.blit_pipe);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_bind_group(1, &self.t.blit_bg, &[]);
-            pass.draw(0..3, 0..1);
-            pass.set_pipeline(&self.quad_pipe);
-            pass.set_vertex_buffer(0, self.qbuf.slice(..));
-            pass.draw(0..6, panel_count..total);
+            if mode.fin {
+                pass.set_pipeline(&self.blit_pipe);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(1, &self.t.blit_bg, &[]);
+                pass.draw(0..3, 0..1);
+                if total > content_count {
+                    pass.set_pipeline(&self.quad_pipe);
+                    pass.set_vertex_buffer(0, self.qbuf.slice(..));
+                    pass.draw(0..6, content_count..total);
+                }
+            }
         }
 
         self.queue.submit([enc.finish()]);
@@ -579,6 +685,14 @@ impl Gfx {
         }
         self.window.pre_present_notify();
         self.queue.present(frame);
+
+        self.content_dirty = false;
+        if self.dirty > 0 {
+            self.dirty -= 1;
+        }
+        if self.bench_active() {
+            self.bench_tick(now);
+        }
     }
 }
 
@@ -622,6 +736,17 @@ impl ApplicationHandler for App {
             el.set_control_flow(ControlFlow::Wait);
             return;
         };
+        if g.bench_active() {
+            // benchmark: draw as fast as the display allows
+            g.window.request_redraw();
+            el.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+        if !g.needs_frame() {
+            // idle: no GPU work at all until the next touch
+            el.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         let now = Instant::now();
         let iv = Duration::from_secs_f32(1.0 / self.settings.fps);
         if now >= self.next_frame {
