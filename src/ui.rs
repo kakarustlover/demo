@@ -1,10 +1,6 @@
 //! Demo UI logic. Only depends on `liquid_rust` (no wgpu), all units are points.
-//!
-//! Everything you see as glass is a `liquid_rust::Glass` in a `Scene`:
-//!   * 3 round buttons in one container (drag them together: they fuse like liquid)
-//!   * 4 pills: Material::regular / tinted / clear / clear_bar presets
-//!   * sliders whose track + thumb are glass too
-//! The sliders edit the public fields of `Material` live (frost, refraction, depth, ...).
+//! Slider tracks are NOT glass (cheap): they are drawn as plain rects into the content
+//! texture (see `content_rects`), only the thumbs are glass.
 
 use liquid_rust::{Color, ContainerId, Glass, GlassId, Material, Rect, Scene, Shape, Vec2};
 
@@ -26,7 +22,6 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        // Roughly Apple's "Clear Glass" values.
         Self { frost: 6.0, refraction: 0.7, depth: 30.0, dispersion: 0.2, specular: 0.4, tint: 0.45, merge: 30.0, corner: 26.0 }
     }
 }
@@ -94,6 +89,8 @@ struct Demo {
 
 struct Row {
     y0: f32,
+    track_y: f32,
+    track_h: f32,
     thumb: Item,
 }
 
@@ -101,8 +98,17 @@ pub struct Text {
     pub x: f32,
     pub y: f32,
     pub s: String,
-    /// Drawn on the dark control panel (always white).
     pub panel: bool,
+}
+
+/// A plain (non-glass) rounded rect drawn into the content texture.
+pub struct ContentRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub r: f32,
+    pub color: [f32; 4],
 }
 
 pub struct Ui {
@@ -131,9 +137,10 @@ pub fn text_w(s: &str) -> f32 {
 }
 
 impl Ui {
-    pub fn new(w: f32, h: f32) -> Self {
+    pub fn new(w: f32, h: f32, dispersion: f32) -> Self {
         let mut scene = Scene::new();
-        let params = Params::default();
+        let mut params = Params::default();
+        params.dispersion = dispersion;
         let top = 56.0;
 
         // --- background switcher
@@ -190,7 +197,7 @@ impl Ui {
             demos.push(Demo { item: Item { id, x, y, w: 150.0, h: 52.0 }, base, color, tinted, pill: true, label });
         }
 
-        // --- slider panel
+        // --- slider panel (tracks are plain rects, only thumbs are glass)
         let panel_y = top + 312.0;
         let first = panel_y + 20.0;
         let bottom = h - 32.0;
@@ -199,18 +206,11 @@ impl Ui {
         let track_h = (row_h - 20.0).clamp(18.0, 30.0);
         let thumb = track_h + 10.0;
         let (track_x, track_w) = (32.0, w - 64.0);
-        let tracks = scene.add_container(0.0, 0);
         let thumbs = scene.add_container(0.0, 1);
         let mut rows = Vec::new();
         for (i, d) in SLIDERS.iter().enumerate() {
             let y0 = first + row_h * i as f32;
             let ty = y0 + 20.0;
-            scene.add(
-                Glass::new(Rect::new(track_x, ty, track_w, track_h))
-                    .shape(Shape::Rounded(track_h / 2.0))
-                    .material(Material::regular())
-                    .container(tracks),
-            );
             let t = (params.get(i) - d.min) / (d.max - d.min);
             let tx = track_x + t.clamp(0.0, 1.0) * (track_w - thumb);
             let thumb_y = ty + track_h / 2.0 - thumb / 2.0;
@@ -221,7 +221,7 @@ impl Ui {
                     .interactive()
                     .container(thumbs),
             );
-            rows.push(Row { y0, thumb: Item { id, x: tx, y: thumb_y, w: thumb, h: thumb } });
+            rows.push(Row { y0, track_y: ty, track_h, thumb: Item { id, x: tx, y: thumb_y, w: thumb, h: thumb } });
         }
 
         let mut ui = Self {
@@ -255,6 +255,7 @@ impl Ui {
         self.scene.set_container_spacing(self.demo_container, p.merge);
     }
 
+    /// Returns true while the scene is still animating (needs more frames).
     pub fn update(&mut self, dt: f32) -> bool {
         self.scene.update(dt)
     }
@@ -325,9 +326,28 @@ impl Ui {
         self.drag = None;
     }
 
-    /// Dark rounded panel drawn into the content texture behind the sliders: (x, y, w, h, radius).
-    pub fn panel(&self) -> (f32, f32, f32, f32, f32) {
-        (12.0, self.panel_y, self.w - 24.0, self.h - 16.0 - self.panel_y, 28.0)
+    /// Plain rects drawn into the content texture (under the glass): dark panel + slider tracks.
+    pub fn content_rects(&self) -> Vec<ContentRect> {
+        let mut v = Vec::new();
+        v.push(ContentRect {
+            x: 12.0,
+            y: self.panel_y,
+            w: self.w - 24.0,
+            h: self.h - 16.0 - self.panel_y,
+            r: 28.0,
+            color: [0.0, 0.0, 0.0, 0.45],
+        });
+        for r in &self.rows {
+            v.push(ContentRect {
+                x: self.track_x,
+                y: r.track_y,
+                w: self.track_w,
+                h: r.track_h,
+                r: r.track_h / 2.0,
+                color: [1.0, 1.0, 1.0, 0.22],
+            });
+        }
+        v
     }
 
     /// All labels, in points. Drawn on top of the glass.
