@@ -31,7 +31,9 @@ public class LogActivity extends Activity {
     private static final int APP_LOG_CHARS = 150_000;
     private static final int PREV_LOG_CHARS = 50_000;
     private static final int LOGCAT_CHARS = 100_000;
-    private static final String[] TIER_NAMES = {"ULTRA", "HIGH", "BALANCED", "LITE", "MINI", "SAFE"};
+            private static final String[] TIER_NAMES = {"ULTRA", "HIGH", "OPTIMIZED", "LITE", "MINI", "AURORA UI"};
+    private static final String[] MODE_LABELS = {"ULTRA", "OPTIMIZED", "AURORA UI"};
+    private static final int[] MODE_TIER = {0, 2, 5};
 
     private TextView logView;
     private TextView qualityView;
@@ -72,12 +74,10 @@ public class LogActivity extends Activity {
         qualityView.setPadding(dp(14), 0, dp(14), dp(6));
         root.addView(qualityView);
 
-        LinearLayout rowQ1 = row();
-        LinearLayout rowQ2 = row();
-        for (int i = 0; i < TIER_NAMES.length; i++) {
-            final int idx = i;
-            Button b = button(TIER_NAMES[i], 0xFF3A4A6B, v -> setTier(idx));
-            (i < 3 ? rowQ1 : rowQ2).addView(b);
+                LinearLayout rowQ1 = row();
+        for (int i = 0; i < MODE_LABELS.length; i++) {
+            final int idx = MODE_TIER[i];
+            rowQ1.addView(button(MODE_LABELS[i], 0xFF3A4A6B, v -> setTier(idx)));
         }
         root.addView(rowQ1);
         root.addView(rowQ2);
