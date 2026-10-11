@@ -1,8 +1,10 @@
 //! Demo UI logic. Only depends on `liquid_rust` (no wgpu), all units are points.
-//! Slider tracks are NOT glass (cheap): they are drawn as plain rects into the content
-//! texture (see `content_rects`), only the thumbs are glass.
+//! Slider tracks are plain rects drawn into the content texture, only the thumbs are glass.
+//! The active quality tier decides which expensive Material effects are enabled.
 
-use liquid_rust::{Color, ContainerId, Glass, GlassId, Material, Rect, Scene, Shape, Vec2};
+use liquid_rust::{Color, ContainerId, Glass, GlassId, Material, Rect, Scene, Shadow, Shape, Vec2};
+
+use crate::tier::TIERS;
 
 pub const BG_NAMES: [&str; 7] = ["AURORA", "OCEAN", "SUNSET", "NEON", "STRIPES", "DOTS", "LIGHT"];
 pub const BG_LIGHT: usize = 6;
@@ -101,7 +103,7 @@ pub struct Text {
     pub panel: bool,
 }
 
-/// A plain (non-glass) rounded rect drawn into the content texture.
+/// A plain (non-glass) rounded rect, in points.
 pub struct ContentRect {
     pub x: f32,
     pub y: f32,
@@ -115,6 +117,7 @@ pub struct Ui {
     pub scene: Scene,
     pub params: Params,
     pub bg: usize,
+    tier: usize,
     w: f32,
     h: f32,
     top: f32,
@@ -136,11 +139,24 @@ pub fn text_w(s: &str) -> f32 {
     (s.chars().count() as f32) * 6.0 * TEXT_DOT - TEXT_DOT
 }
 
+fn flat(v: &mut Vec<ContentRect>, x: f32, y: f32, w: f32, h: f32, r: f32, rgb: [f32; 3], a: f32) {
+    // rim
+    v.push(ContentRect { x, y, w, h, r, color: [rgb[0], rgb[1], rgb[2], 0.38] });
+    // fill
+    v.push(ContentRect {
+        x: x + 1.5,
+        y: y + 1.5,
+        w: (w - 3.0).max(1.0),
+        h: (h - 3.0).max(1.0),
+        r: (r - 1.5).max(0.0),
+        color: [rgb[0], rgb[1], rgb[2], a],
+    });
+}
+
 impl Ui {
-    pub fn new(w: f32, h: f32, dispersion: f32) -> Self {
+    pub fn new(w: f32, h: f32, tier: usize) -> Self {
         let mut scene = Scene::new();
-        let mut params = Params::default();
-        params.dispersion = dispersion;
+        let params = Params::default();
         let top = 56.0;
 
         // --- background switcher
@@ -197,7 +213,8 @@ impl Ui {
             demos.push(Demo { item: Item { id, x, y, w: 150.0, h: 52.0 }, base, color, tinted, pill: true, label });
         }
 
-        // --- slider panel (tracks are plain rects, only thumbs are glass)
+        // --- slider panel (tracks are plain rects, only thumbs are glass; same z as the rest
+        //     so liquid-rust never has to re-render a lower glass layer)
         let panel_y = top + 312.0;
         let first = panel_y + 20.0;
         let bottom = h - 32.0;
@@ -206,7 +223,7 @@ impl Ui {
         let track_h = (row_h - 20.0).clamp(18.0, 30.0);
         let thumb = track_h + 10.0;
         let (track_x, track_w) = (32.0, w - 64.0);
-        let thumbs = scene.add_container(0.0, 1);
+        let thumbs = scene.add_container(0.0, 0);
         let mut rows = Vec::new();
         for (i, d) in SLIDERS.iter().enumerate() {
             let y0 = first + row_h * i as f32;
@@ -225,7 +242,7 @@ impl Ui {
         }
 
         let mut ui = Self {
-            scene, params, bg: 0, w, h, top, panel_y, row_h, track_x, track_w,
+            scene, params, bg: 0, tier: tier.min(TIERS.len() - 1), w, h, top, panel_y, row_h, track_x, track_w,
             prev, next, demos, demo_container, rows,
             active_slider: None, drag: None, down: None,
         };
@@ -233,17 +250,29 @@ impl Ui {
         ui
     }
 
-    /// Push the current slider values into every demo glass (Material fields are public).
+    pub fn set_tier(&mut self, tier: usize) {
+        self.tier = tier.min(TIERS.len() - 1);
+        self.apply_params();
+    }
+
+    /// Push slider values + the tier's cost limits into every demo glass.
+    /// (Material fields are public; zeroed effects are skipped entirely by the shader.)
     pub fn apply_params(&mut self) {
         let p = self.params;
+        let t = TIERS[self.tier];
         for d in &self.demos {
             let b = d.base;
             let m = Material {
-                frost: p.frost,
+                frost: p.frost * t.frost,
                 refraction: p.refraction,
                 depth: p.depth,
-                dispersion: p.dispersion,
+                dispersion: if t.disp { p.dispersion } else { 0.0 },
                 specular: p.specular,
+                rim: if t.rim { b.rim } else { 0.0 },
+                rim_shade: if t.rim { b.rim_shade } else { 0.0 },
+                hairline: if t.hairline { b.hairline } else { 0.0 },
+                edge: if t.edge { b.edge } else { 0.0 },
+                shadow: Shadow { opacity: if t.shadow { b.shadow.opacity } else { 0.0 }, ..b.shadow },
                 tint: if d.tinted { Some(d.color.with_alpha(p.tint)) } else { b.tint },
                 ..b
             };
@@ -252,6 +281,7 @@ impl Ui {
                 self.scene.set_shape(d.item.id, Shape::Rounded(p.corner.min(d.item.h / 2.0)));
             }
         }
+        // thumbs and nav buttons keep the preset but obey the tier too
         self.scene.set_container_spacing(self.demo_container, p.merge);
     }
 
@@ -346,6 +376,23 @@ impl Ui {
                 r: r.track_h / 2.0,
                 color: [1.0, 1.0, 1.0, 0.22],
             });
+        }
+        v
+    }
+
+    /// SAFE tier: the glass drawn as flat translucent rects (liquid-rust is not called).
+    pub fn flat_glass(&self) -> Vec<ContentRect> {
+        let mut v = Vec::new();
+        let white = [1.0, 1.0, 1.0];
+        flat(&mut v, self.prev.x, self.prev.y, self.prev.w, self.prev.h, 26.0, white, 0.16);
+        flat(&mut v, self.next.x, self.next.y, self.next.w, self.next.h, 26.0, white, 0.16);
+        for d in &self.demos {
+            let r = if d.pill { self.params.corner.min(d.item.h / 2.0) } else { d.item.h / 2.0 };
+            let (rgb, a) = if d.tinted { ([0.05, 0.3, 1.0], 0.55) } else { (white, 0.16) };
+            flat(&mut v, d.item.x, d.item.y, d.item.w, d.item.h, r, rgb, a);
+        }
+        for r in &self.rows {
+            flat(&mut v, r.thumb.x, r.thumb.y, r.thumb.w, r.thumb.h, r.thumb.w / 2.0, white, 0.30);
         }
         v
     }
