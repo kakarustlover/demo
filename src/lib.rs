@@ -1,12 +1,8 @@
-//! Android (NativeActivity) demo of the `liquid-rust` crate.
+//! Android (NativeActivity) music-player UI test built on the `liquid-rust` crate.
 //!
-//! Robustness / performance design:
-//!  * 6 quality tiers (tier.rs). Tier 5 (SAFE) never calls the glass shader.
-//!  * runtime governor: if frames are too slow while something moves, drop a tier
-//!  * crash / black-screen detection across launches (running.flag + state.txt)
-//!  * catch_unwind around rendering -> SAFE
-//!  * scene rendered at reduced resolution; background baked; no frames while idle
-//!  * extensive log lines: INIT, STAT (every second), TIER (every change), BENCH
+//! Modes (tier.rs): ULTRA (0), OPTIMIZED (2), AURORA (5 = glass off, flat aurora cards).
+//! A governor walks down the ladder when the device is too slow. Crash / black-screen
+//! detection across launches, catch_unwind safety net, extensive logs (INIT/STAT/TIER/BENCH).
 //! Settings come from <files dir>/config.txt: tier=2 auto=1 anim=0 bench=0
 
 mod font;
@@ -25,7 +21,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use tier::{LAST, TIERS};
-use ui::{text_w, ContentRect, Ui, BG_LIGHT, TEXT_DOT};
+use ui::{text_w, ContentRect, Ui};
+
+const FPS_DOT: f32 = 1.5;
 
 // ---------------------------------------------------------------- settings / state files
 
@@ -147,11 +145,12 @@ fn push_text(out: &mut Vec<Quad>, x: f32, y: f32, dot: f32, s: &str, rgb: [f32; 
     }
 }
 
+/// Colours are given in sRGB; the render target is sRGB, so convert rgb to linear here.
 fn push_rects(out: &mut Vec<Quad>, rects: &[ContentRect], s: f32) {
     for r in rects {
         out.push(Quad {
             rect: [r.x * s, r.y * s, r.w * s, r.h * s],
-            color: r.color,
+            color: [lin(r.color[0]), lin(r.color[1]), lin(r.color[2]), r.color[3]],
             radius: [r.r * s, 0.0, 0.0, 0.0],
         });
     }
@@ -267,6 +266,8 @@ struct Gfx {
     dirty: u32,
     content_dirty: bool,
     last_bg: usize,
+    /// While the (fake) playback runs we wake up 4x per second to move the progress bar.
+    next_progress: Instant,
     // governor
     active_run: u32,
     ema: f32,
@@ -299,7 +300,6 @@ impl Gfx {
         let caps = surface.get_capabilities(&adapter);
         log::info!("adapter: {:?}", adapter.get_info());
         log::info!("adapter features: {:?}", adapter.features());
-        log::info!("adapter limits: {:?}", adapter.limits());
         log::info!(
             "surface caps: formats={:?} present_modes={:?} alpha={:?}",
             caps.formats, caps.present_modes, caps.alpha_modes
@@ -483,7 +483,7 @@ impl Gfx {
             window, surface, device, queue, config, srgb, renderer, bg_pipe, quad_pipe, blit_pipe, bind_group,
             tex_bgl, sampler, ubuf, qbuf, t, ui, settings, dir, state, tier, scale, start: now, last: now,
             touch: None, frames: 0, presented: 0, health_ok: false, fps_val: 0.0,
-            dirty: 8, content_dirty: true, last_bg: 0,
+            dirty: 8, content_dirty: true, last_bg: 0, next_progress: now,
             active_run: 0, ema: 0.0, since_change: 0,
             bench: Bench { mode: 0, t0: now, frames: 0, warm: false, done: !settings.bench, saved_tier: start_tier },
             st: Stat { t0: now, frames: 0, active: 0, gap_sum: 0.0, cpu_ms: 0.0, glass_ms: 0.0 },
@@ -535,7 +535,7 @@ impl Gfx {
     }
 
     fn fallback(&mut self, reason: &str) {
-        log::error!("FALLBACK to SAFE: {}", reason);
+        log::error!("FALLBACK to AURORA: {}", reason);
         self.degrade(LAST, reason);
     }
 
@@ -552,12 +552,12 @@ impl Gfx {
         self.active_run += 1;
         self.since_change += 1;
         self.ema = if self.ema == 0.0 { gap } else { self.ema * 0.9 + gap * 0.1 };
-        let target = 1.0 / TIERS[self.tier].fps;
-        if self.since_change > 8 && self.active_run >= 20 && self.ema > target * 1.4 {
-            let step = if self.ema > target * 3.0 { 2 } else { 1 };
+        let limit = 1.0 / TIERS[self.tier].min_fps;
+        if self.since_change > 8 && self.active_run >= 20 && self.ema > limit {
+            let step = if self.ema > limit * 2.5 { 2 } else { 1 };
             let reason = format!(
-                "auto: avg frame {:.1} ms > {:.1} ms (target {:.1} ms)",
-                self.ema * 1000.0, target * 1400.0, target * 1000.0
+                "auto: avg frame {:.1} ms > {:.1} ms (min {} fps)",
+                self.ema * 1000.0, limit * 1000.0, TIERS[self.tier].min_fps
             );
             let to = self.tier + step;
             self.degrade(to, &reason);
@@ -613,6 +613,7 @@ impl Gfx {
 
     fn touch_event(&mut self, t: winit::event::Touch) {
         self.dirty = 8;
+        self.ui.set_now((Instant::now() - self.start).as_secs_f32());
         let (x, y) = (t.location.x as f32 / self.scale, t.location.y as f32 / self.scale);
         match t.phase {
             TouchPhase::Started if self.touch.is_none() => {
@@ -630,7 +631,7 @@ impl Gfx {
         }
     }
 
-    /// Background + plain content rects into the content texture.
+    /// Background + static content rects into the content texture.
     fn content_pass(&self, enc: &mut wgpu::CommandEncoder, content_count: u32) {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("content"),
@@ -662,6 +663,9 @@ impl Gfx {
         if self.ui.update(dt) {
             self.dirty = self.dirty.max(2);
         }
+        // fake playback clock (UI only, no audio)
+        self.ui.set_now((now - self.start).as_secs_f32());
+        self.ui.tick();
 
         self.frames += 1;
         let n = self.frames;
@@ -702,8 +706,8 @@ impl Gfx {
 
         let bg_changed = self.ui.bg != self.last_bg;
         self.last_bg = self.ui.bg;
-        // The background is baked: redrawn only when it changed.
-        let redraw_content = self.content_dirty || bg_changed || self.settings.anim || self.bench_active();
+        // The background is baked: redrawn only when it changed (track change) or if anim is on.
+        let redraw_content = self.content_dirty || bg_changed || self.settings.anim;
 
         let (w, h) = (self.config.width, self.config.height);
         let (sw, sh) = self.t.size;
@@ -717,22 +721,21 @@ impl Gfx {
             bytemuck::bytes_of(&Uniforms { res: [w as f32, h as f32], time: t_anim, kind: self.ui.bg as u32 }),
         );
 
-        // Quads: [content rects][flat glass (SAFE only)][labels]
+        // Quads: [content rects][flat glass (AURORA only)][overlay: art, bars, icons][text]
         let mut quads: Vec<Quad> = Vec::new();
         push_rects(&mut quads, &self.ui.content_rects(), s);
         let content_count = quads.len() as u32;
         if !tier.glass {
             push_rects(&mut quads, &self.ui.flat_glass(), s);
         }
-        let light = self.ui.bg == BG_LIGHT;
+        push_rects(&mut quads, &self.ui.overlay_rects(), s);
         for t in self.ui.texts() {
-            let rgb = if t.panel || !light { [1.0, 1.0, 1.0] } else { [0.08, 0.08, 0.1] };
-            push_text(&mut quads, t.x * s, t.y * s, TEXT_DOT * s, &t.s, rgb);
+            let rgb = if t.dim { [0.72, 0.72, 0.78] } else { [1.0, 1.0, 1.0] };
+            push_text(&mut quads, t.x * s, t.y * s, t.dot * s, &t.s, rgb);
         }
         let fps_label = format!("{} {:.0} FPS", tier.name, self.fps_val);
-        let fps_x = (w as f32 / s - text_w(&fps_label) - 12.0) * s;
-        let fps_rgb = if light { [0.08, 0.08, 0.1] } else { [1.0, 1.0, 0.4] };
-        push_text(&mut quads, fps_x, 8.0 * s, TEXT_DOT * s, &fps_label, fps_rgb);
+        let fps_x = (w as f32 / s - text_w(&fps_label, FPS_DOT) - 8.0) * s;
+        push_text(&mut quads, fps_x, 6.0 * s, FPS_DOT * s, &fps_label, [1.0, 1.0, 0.4]);
         quads.truncate(MAX_QUADS);
         self.queue.write_buffer(&self.qbuf, 0, bytemuck::cast_slice(&quads));
         let total = quads.len() as u32;
@@ -740,7 +743,7 @@ impl Gfx {
         let target_view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.srgb), ..Default::default() });
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        // 1) content (baked background + plain rects) - only when it changed
+        // 1) content (baked background + scrim) - only when it changed
         if redraw_content {
             self.content_pass(&mut enc, content_count);
         }
@@ -764,7 +767,7 @@ impl Gfx {
             );
             glass_ms = tg.elapsed().as_secs_f32() * 1000.0;
         } else {
-            // SAFE: no glass shader. Scene = plain copy of the content.
+            // AURORA: no glass shader. Scene = plain copy of the content.
             enc.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.t.content,
@@ -782,7 +785,7 @@ impl Gfx {
             );
         }
 
-        // 3) upscale the scene to the screen + flat glass (SAFE) + sharp labels
+        // 3) upscale the scene to the screen + flat cards (AURORA) + crisp overlay + text
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("final"),
@@ -921,7 +924,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let Some(g) = &self.gfx else {
+        let Some(g) = self.gfx.as_mut() else {
             el.set_control_flow(ControlFlow::Wait);
             return;
         };
@@ -931,12 +934,21 @@ impl ApplicationHandler for App {
             el.set_control_flow(ControlFlow::Poll);
             return;
         }
+        let now = Instant::now();
+        // fake playback: wake up 4x per second to move the progress bar
+        if g.ui.is_playing() && now >= g.next_progress {
+            g.dirty = g.dirty.max(1);
+            g.next_progress = now + Duration::from_millis(250);
+        }
         if !g.needs_frame() {
-            // idle: no GPU work at all until the next touch
-            el.set_control_flow(ControlFlow::Wait);
+            if g.ui.is_playing() {
+                el.set_control_flow(ControlFlow::WaitUntil(g.next_progress));
+            } else {
+                // idle: no GPU work at all until the next touch
+                el.set_control_flow(ControlFlow::Wait);
+            }
             return;
         }
-        let now = Instant::now();
         let iv = g.frame_interval();
         if now >= self.next_frame {
             g.window.request_redraw();
