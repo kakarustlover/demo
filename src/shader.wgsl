@@ -137,3 +137,11 @@ fn fs_quad(in: QOut) -> @location(0) vec4<f32> {
     let a = clamp(0.5 - d, 0.0, 1.0);
     return vec4<f32>(in.color.rgb, in.color.a * a);
 }
+
+@group(1) @binding(0) var scene_tex: texture_2d<f32>;
+@group(1) @binding(1) var scene_smp: sampler;
+
+@fragment
+fn fs_blit(in: BgOut) -> @location(0) vec4<f32> {
+    return textureSample(scene_tex, scene_smp, in.uv);
+}
